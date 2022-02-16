@@ -1,0 +1,168 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::time::Duration;
+
+use smithay::reexports::*;
+use smithay::wayland::{
+    data_device::{
+        default_action_chooser, init_data_device, set_data_device_focus, DataDeviceEvent,
+    },
+    output::{xdg::init_xdg_output_manager, Output},
+    seat::{CursorImageStatus, KeyboardHandle, PointerHandle, Seat},
+    shm,
+    tablet_manager::{init_tablet_manager_global, TabletSeatTrait},
+};
+use smithay::xwayland::{XWayland, XWaylandEvent};
+
+use calloop::{generic::Generic, Interest, LoopHandle, Mode, PostAction};
+use slog::{error, info, Logger};
+use wayland_server::{protocol::wl_surface::WlSurface, Display};
+
+use crate::{output_map::OutputMap, shell::ShellHandles, window_map::WindowMap};
+
+pub trait BackendData {
+    fn seat_name(&self) -> String;
+    fn reset_buffers(&mut self, output: &Output);
+}
+
+#[allow(dead_code)]
+pub struct State<B> {
+    backend_data: B,
+    socket_name: Option<String>,
+    running: Cell<bool>,
+    display: Rc<RefCell<Display>>,
+    handle: LoopHandle<'static, Self>,
+    window_map: Rc<RefCell<WindowMap>>,
+    output_map: Rc<RefCell<OutputMap>>,
+    drag_icon: Rc<Cell<Option<WlSurface>>>,
+    log: Logger,
+
+    pointer: PointerHandle,
+    keyboard: KeyboardHandle,
+    seat_name: String,
+
+    xwayland: XWayland<Self>,
+}
+
+impl<B: BackendData + 'static> State<B> {
+    pub fn init(
+        display_rc: Rc<RefCell<Display>>,
+        handle: LoopHandle<'static, Self>,
+        backend_data: B,
+        log: Logger,
+        listen_on_socket: bool,
+    ) -> Self {
+        let display = display_rc.clone();
+        let display = &mut display.borrow_mut();
+
+        {
+            let event_source = Generic::from_fd(display.get_poll_fd(), Interest::READ, Mode::Level);
+            let cb = |_, _: &mut _, state: &mut Self| {
+                let display = state.display.clone();
+                let dispatch_result = display.borrow_mut().dispatch(Duration::ZERO, state);
+                if let Err(e) = dispatch_result {
+                    error!(state.log, "I/O error on the Wayland display: {e}");
+                    state.running.set(false);
+                    Err(e)
+                } else {
+                    Ok(PostAction::Continue)
+                }
+            };
+            handle
+                .insert_source(event_source, cb)
+                .expect("failed to init wayland event source");
+        }
+
+        shm::init_shm_global(display, vec![], log.clone());
+
+        let ShellHandles {
+            window_map,
+            output_map,
+        } = ShellHandles::init::<B>(display_rc.clone(), log.clone());
+
+        init_xdg_output_manager(display, log.clone());
+
+        let socket_name = if listen_on_socket {
+            let name = display.add_socket_auto().unwrap().into_string().unwrap();
+            info!(log, "Listening on wayland socket"; "name" => &name);
+            std::env::set_var("WAYLAND_DISPLAY", &name);
+            Some(name)
+        } else {
+            None
+        };
+
+        let drag_icon: Rc<Cell<_>> = Default::default();
+
+        {
+            let drag_icon = drag_icon.clone();
+            let cb = move |event| match event {
+                DataDeviceEvent::DnDStarted { icon, .. } => drag_icon.set(icon),
+                DataDeviceEvent::DnDDropped => drag_icon.set(None),
+                _ => (),
+            };
+            init_data_device(display, cb, default_action_chooser, log.clone());
+        }
+
+        let seat_name = backend_data.seat_name();
+        let (mut seat, _) = Seat::new(display, seat_name.clone(), log.clone());
+
+        let cursor_status = Rc::new(Cell::new(CursorImageStatus::Default));
+
+        let pointer = {
+            let cursor_status = cursor_status.clone();
+            let cb = move |status| cursor_status.set(status);
+            seat.add_pointer(cb)
+        };
+
+        {
+            init_tablet_manager_global(display);
+            let cursor_status = cursor_status.clone();
+            let cb = move |_tool: &_, status| cursor_status.set(status);
+            seat.tablet_seat().on_cursor_surface(cb);
+        }
+
+        let keyboard = {
+            let cb = |seat: &_, focus: Option<&WlSurface>| {
+                set_data_device_focus(seat, focus.and_then(|s| s.as_ref().client()))
+            };
+            seat.add_keyboard(Default::default(), 200, 25, cb)
+                .expect("Failed to initialize the keyboard")
+        };
+
+        let xwayland = {
+            let (xwayland, channel) =
+                XWayland::new(handle.clone(), display_rc.clone(), log.clone());
+            let cb = |event, _: &mut _, state: &mut Self| match event {
+                XWaylandEvent::Ready { connection, client } => {
+                    state.xwayland_ready(connection, client)
+                }
+                XWaylandEvent::Exited => state.xwayland_exited(),
+            };
+            if let Err(e) = handle.insert_source(channel, cb) {
+                error!(
+                    log,
+                    "Failed to insert the XWaylandSource into the event loop: {e}",
+                );
+            }
+            xwayland
+        };
+
+        Self {
+            backend_data,
+            socket_name,
+            running: Default::default(),
+            display: display_rc,
+            handle,
+            window_map,
+            output_map,
+            drag_icon,
+            log,
+
+            pointer,
+            keyboard,
+            seat_name,
+
+            xwayland,
+        }
+    }
+}
