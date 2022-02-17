@@ -6,8 +6,17 @@ edition = "2021"
 [dependencies]
 slog = "2.7.0"
 slog-term = "2.8.1"
+sugars = "3.0.1"
 
 [dependencies.smithay]
 version = "0.3.0"
 default-features = false
-features = ["backend_udev", "backend_session_logind", "wayland_frontend", "xwayland"]
+features = [
+    "backend_drm",
+    "backend_libinput",
+    "backend_session_logind",
+    "backend_udev",
+    "renderer_gl",
+    "wayland_frontend",
+    "xwayland",
+]

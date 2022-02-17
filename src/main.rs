@@ -4,6 +4,10 @@ use std::sync::Mutex;
 
 use slog::{Drain, Logger};
 
+#[macro_use]
+mod util;
+
+mod input_handler;
 mod output_map;
 mod shell;
 mod state;

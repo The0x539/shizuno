@@ -7,7 +7,7 @@ use smithay::wayland::{
     data_device::{
         default_action_chooser, init_data_device, set_data_device_focus, DataDeviceEvent,
     },
-    output::{xdg::init_xdg_output_manager, Output},
+    output::xdg::init_xdg_output_manager,
     seat::{CursorImageStatus, KeyboardHandle, PointerHandle, Seat},
     shm,
     tablet_manager::{init_tablet_manager_global, TabletSeatTrait},
@@ -20,31 +20,32 @@ use wayland_server::{protocol::wl_surface::WlSurface, Display};
 
 use crate::{output_map::OutputMap, shell::ShellHandles, window_map::WindowMap};
 
-pub trait BackendData {
+pub trait Backend {
     fn seat_name(&self) -> String;
-    fn reset_buffers(&mut self, output: &Output);
 }
 
 #[allow(dead_code)]
 pub struct State<B> {
-    backend_data: B,
+    pub backend_data: B,
     socket_name: Option<String>,
-    running: Cell<bool>,
+    pub running: Cell<bool>,
     display: Rc<RefCell<Display>>,
     handle: LoopHandle<'static, Self>,
-    window_map: Rc<RefCell<WindowMap>>,
-    output_map: Rc<RefCell<OutputMap>>,
+    pub window_map: Rc<RefCell<WindowMap>>,
+    pub output_map: Rc<RefCell<OutputMap>>,
     drag_icon: Rc<Cell<Option<WlSurface>>>,
     log: Logger,
 
     pointer: PointerHandle,
     keyboard: KeyboardHandle,
-    seat_name: String,
+    pub seat_name: String,
+    cursor_status: Rc<Cell<CursorImageStatus>>,
+    seat: Seat,
 
     xwayland: XWayland<Self>,
 }
 
-impl<B: BackendData + 'static> State<B> {
+impl<B: Backend + 'static> State<B> {
     pub fn init(
         display_rc: Rc<RefCell<Display>>,
         handle: LoopHandle<'static, Self>,
@@ -57,7 +58,7 @@ impl<B: BackendData + 'static> State<B> {
 
         {
             let event_source = Generic::from_fd(display.get_poll_fd(), Interest::READ, Mode::Level);
-            let cb = |_, _: &mut _, state: &mut Self| {
+            let cb = cb!(_, state => {
                 let display = state.display.clone();
                 let dispatch_result = display.borrow_mut().dispatch(Duration::ZERO, state);
                 if let Err(e) = dispatch_result {
@@ -67,7 +68,7 @@ impl<B: BackendData + 'static> State<B> {
                 } else {
                     Ok(PostAction::Continue)
                 }
-            };
+            });
             handle
                 .insert_source(event_source, cb)
                 .expect("failed to init wayland event source");
@@ -160,7 +161,9 @@ impl<B: BackendData + 'static> State<B> {
 
             pointer,
             keyboard,
+            cursor_status,
             seat_name,
+            seat,
 
             xwayland,
         }

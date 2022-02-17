@@ -7,6 +7,10 @@ use wayland_server::Client;
 use crate::state::State;
 
 impl<B> State<B> {
+    pub fn start_xwayland(&mut self) {
+        todo!()
+    }
+
     pub fn xwayland_ready(&mut self, _connection: UnixStream, _client: Client) {
         todo!()
     }

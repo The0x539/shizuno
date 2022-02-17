@@ -123,10 +123,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea835d29036a4087793836fa931b08837ad5e957da9e23886b29586fb9b6650"
 
 [[package]]
+name = "drm"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c00d7f6793e5450d907535c66e036b3bb8db6df933025e3ceb0aac1e8f6c63de"
+dependencies = [
+ "drm-ffi",
+ "drm-fourcc",
+ "nix",
+]
+
+[[package]]
+name = "drm-ffi"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "198d1b7fdb33b75e9bd08ba6842ddb730760f7eeea25552acc88c5403c4f0652"
+dependencies = [
+ "drm-sys",
+ "nix",
+]
+
+[[package]]
 name = "drm-fourcc"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0aafbcdb8afc29c1a7ee5fbe53b5d62f4565b35a042a662ca9fecd0b54dae6f4"
+
+[[package]]
+name = "drm-sys"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f45fcdd3b2f3c13fadea11b2a4eda2023e7de55021da039eac4a3beecfe91c"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "fastrand"
@@ -146,6 +176,17 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "gl_generator"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a95dfc23a2b4a9a2f5ab41d194f8bfda3cabec42af4e39f08c339eb2a0c124d"
+dependencies = [
+ "khronos_api",
+ "log",
+ "xml-rs",
 ]
 
 [[package]]
@@ -186,6 +227,12 @@ checksum = "7a5bbe824c507c5da5956355e86a746d82e0e1464f65d862cc5e71da70e94b2c"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "khronos_api"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "lazy_static"
@@ -385,7 +432,10 @@ dependencies = [
  "cgmath",
  "dbus",
  "downcast-rs",
+ "drm",
+ "drm-ffi",
  "drm-fourcc",
+ "gl_generator",
  "input",
  "lazy_static",
  "libc",
@@ -402,6 +452,12 @@ dependencies = [
  "wayland-server",
  "xkbcommon",
 ]
+
+[[package]]
+name = "sugars"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc0db74f9ee706e039d031a560bd7d110c7022f016051b3d33eeff9583e3e67a"
 
 [[package]]
 name = "syn"
@@ -579,6 +635,7 @@ dependencies = [
  "slog",
  "slog-term",
  "smithay",
+ "sugars",
 ]
 
 [[package]]
