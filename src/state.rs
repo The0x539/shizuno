@@ -1,8 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smithay::reexports::*;
+use smithay::utils::{Logical, Point};
 use smithay::wayland::{
     data_device::{
         default_action_chooser, init_data_device, set_data_device_focus, DataDeviceEvent,
@@ -18,7 +19,7 @@ use calloop::{generic::Generic, Interest, LoopHandle, Mode, PostAction};
 use slog::{error, info, Logger};
 use wayland_server::{protocol::wl_surface::WlSurface, Display};
 
-use crate::{output_map::OutputMap, shell::ShellHandles, window_map::WindowMap};
+use crate::{output_map::OutputMap, shell::ShellHandles, util::PseudoCell, window_map::WindowMap};
 
 pub trait Backend {
     fn seat_name(&self) -> String;
@@ -33,14 +34,16 @@ pub struct State<B> {
     handle: LoopHandle<'static, Self>,
     pub window_map: Rc<RefCell<WindowMap>>,
     pub output_map: Rc<RefCell<OutputMap>>,
-    drag_icon: Rc<Cell<Option<WlSurface>>>,
-    log: Logger,
+    pub drag_icon: Rc<RefCell<Option<WlSurface>>>,
+    pub log: Logger,
 
     pointer: PointerHandle,
     keyboard: KeyboardHandle,
+    pub pointer_location: Point<f64, Logical>,
     pub seat_name: String,
-    cursor_status: Rc<Cell<CursorImageStatus>>,
+    pub cursor_status: Rc<RefCell<CursorImageStatus>>,
     seat: Seat,
+    pub start_time: Instant,
 
     xwayland: XWayland<Self>,
 }
@@ -92,7 +95,7 @@ impl<B: Backend + 'static> State<B> {
             None
         };
 
-        let drag_icon: Rc<Cell<_>> = Default::default();
+        let drag_icon: Rc<RefCell<_>> = Default::default();
 
         {
             let drag_icon = drag_icon.clone();
@@ -107,7 +110,7 @@ impl<B: Backend + 'static> State<B> {
         let seat_name = backend_data.seat_name();
         let (mut seat, _) = Seat::new(display, seat_name.clone(), log.clone());
 
-        let cursor_status = Rc::new(Cell::new(CursorImageStatus::Default));
+        let cursor_status = Rc::new(RefCell::new(CursorImageStatus::Default));
 
         let pointer = {
             let cursor_status = cursor_status.clone();
@@ -161,9 +164,11 @@ impl<B: Backend + 'static> State<B> {
 
             pointer,
             keyboard,
+            pointer_location: Default::default(),
             cursor_status,
             seat_name,
             seat,
+            start_time: Instant::now(),
 
             xwayland,
         }

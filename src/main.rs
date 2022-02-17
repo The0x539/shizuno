@@ -7,6 +7,8 @@ use slog::{Drain, Logger};
 #[macro_use]
 mod util;
 
+mod cursor;
+mod drawing;
 mod input_handler;
 mod output_map;
 mod shell;

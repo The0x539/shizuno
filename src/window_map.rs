@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub struct WindowMap;
 
 impl WindowMap {
@@ -6,6 +8,10 @@ impl WindowMap {
     }
 
     pub fn clear(&mut self) {
+        todo!()
+    }
+
+    pub fn send_frames(&self, _time: Duration) {
         todo!()
     }
 }

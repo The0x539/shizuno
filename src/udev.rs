@@ -1,32 +1,65 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use smithay::backend::{
+    drm::{DrmError, GbmBufferedSurface},
     libinput::{LibinputInputBackend, LibinputSessionInterface},
-    renderer::{gles2::Gles2Renderer, ImportDma},
+    renderer::{
+        gles2::{Gles2Frame, Gles2Renderer, Gles2Texture},
+        Bind, Frame, ImportDma, Renderer, Transform,
+    },
     session::{auto::AutoSession, Session},
     udev::{primary_gpu, UdevBackend, UdevEvent},
+    SwapBuffersError,
 };
 use smithay::reexports::*;
-use smithay::utils::signaling::Linkable;
-use smithay::wayland::dmabuf::init_dmabuf_global;
+use smithay::utils::{signaling::Linkable, Logical, Point};
+use smithay::wayland::{dmabuf::init_dmabuf_global, seat::CursorImageStatus};
 
-use calloop::{timer::Timer, EventLoop};
+use calloop::{
+    timer::{Timer, TimerHandle},
+    EventLoop,
+};
 use drm::control::crtc;
+use either::Either;
+use image::ImageBuffer;
 use input::Libinput;
 use nix::libc::dev_t;
-use slog::{crit, Logger};
+use slog::{crit, debug, error, warn, Logger};
 use sugars::dur;
-use wayland_server::{DispatchData, Display};
+use wayland_server::{protocol::wl_surface::WlSurface, DispatchData, Display};
+use xcursor::parser::Image;
 
-use crate::state::{Backend, State};
+use crate::{
+    cursor::Cursor,
+    drawing::*,
+    output_map::OutputMap,
+    state::{Backend, State},
+    window_map::WindowMap,
+};
+
+pub struct SessionFd(RawFd);
+impl AsRawFd for SessionFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+#[derive(PartialEq)]
+struct UdevOutputId {
+    device_id: dev_t,
+    crtc: crtc::Handle,
+}
 
 pub struct UdevData {
     session: AutoSession,
-    gpu: Option<PathBuf>,
+    _gpu: Option<PathBuf>,
     backends: HashMap<dev_t, BackendData>,
+    pointer_image: Cursor,
+    render_timer: TimerHandle<(u64, crtc::Handle)>,
 }
 
 impl Backend for UdevData {
@@ -35,8 +68,21 @@ impl Backend for UdevData {
     }
 }
 
+pub type RenderSurface = GbmBufferedSurface<SessionFd>;
+
+struct SurfaceData {
+    surface: RenderSurface,
+    #[cfg(feature = "debug")]
+    fps: fps_ticker::Fps,
+}
+
 struct BackendData {
+    surfaces: Rc<RefCell<HashMap<crtc::Handle, Rc<RefCell<SurfaceData>>>>>,
+    pointer_images: HashMap<*const Image, Gles2Texture>,
+    #[cfg(feature = "debug")]
+    fps_texture: Gles2Texture,
     renderer: Rc<RefCell<Gles2Renderer>>,
+    dev_id: u64,
 }
 
 pub fn run(log: Logger) {
@@ -58,8 +104,10 @@ pub fn run(log: Logger) {
 
     let data = UdevData {
         session,
-        gpu,
+        _gpu: gpu,
         backends: HashMap::new(),
+        pointer_image: Cursor::load(&log),
+        render_timer: timer.handle(),
     };
 
     let handle = event_loop.handle();
@@ -167,7 +215,173 @@ impl State<UdevData> {
         todo!()
     }
 
-    fn render(&mut self, _dev_id: u64, _crtc: Option<crtc::Handle>) {
-        todo!()
+    fn render(&mut self, dev_id: u64, crtc: Option<crtc::Handle>) {
+        let backend = match self.backend_data.backends.get_mut(&dev_id) {
+            Some(backend) => backend,
+            None => {
+                error!(
+                    self.log,
+                    "Trying to render on non-existent backend {dev_id}",
+                );
+                return;
+            }
+        };
+
+        let surfaces = backend.surfaces.borrow();
+
+        let to_render = match crtc {
+            Some(crtc) => Either::Left(
+                surfaces
+                    .get(&crtc)
+                    .map(|surface| (crtc, surface))
+                    .into_iter(),
+            ),
+            None => Either::Right(surfaces.iter().map(|(&c, s)| (c, s))),
+        };
+
+        for (crtc, surface) in to_render {
+            // TODO: get scale from render surface
+            let scale = 1;
+            let frame = self
+                .backend_data
+                .pointer_image
+                .get_image(scale, self.start_time.elapsed());
+
+            let renderer = &mut backend.renderer.borrow_mut();
+
+            let pointer_image = backend
+                .pointer_images
+                .entry(Rc::as_ptr(&frame))
+                .or_insert_with(|| {
+                    let image =
+                        ImageBuffer::from_raw(frame.width, frame.height, &*frame.pixels_rgba)
+                            .unwrap();
+                    import_bitmap(renderer, &image).expect("Failed to import cursor bitmap")
+                });
+
+            let result = render_surface(
+                &mut surface.borrow_mut(),
+                renderer,
+                backend.dev_id,
+                crtc,
+                &mut self.window_map.borrow_mut(),
+                &self.output_map.borrow(),
+                self.pointer_location,
+                &pointer_image,
+                #[cfg(feature = "debug")]
+                &backend.fps_texture,
+                &self.drag_icon.borrow(),
+                &mut self.cursor_status.borrow_mut(),
+                &self.log,
+            );
+
+            if let Err(e) = result {
+                warn!(self.log, "Error during rendering: {e:?}");
+                let reschedule = match e {
+                    SwapBuffersError::AlreadySwapped => false,
+                    SwapBuffersError::TemporaryFailure(e) => match e.downcast_ref() {
+                        Some(DrmError::DeviceInactive) => false,
+                        Some(DrmError::Access { source, .. }) => {
+                            !matches!(source, drm::SystemError::PermissionDenied)
+                        }
+                        _ => true,
+                    },
+                    SwapBuffersError::ContextLost(e) => panic!("Rendering loop lost: {e}"),
+                };
+
+                if reschedule {
+                    debug!(self.log, "Rescheduling");
+                    self.backend_data
+                        .render_timer
+                        .add_timeout(dur!(1 sec) / 60, (backend.dev_id, crtc));
+                } else {
+                    // TODO: only send drawn windows the frames callback
+                    // Send frame events so that client start drawing their next frame
+                    self.window_map
+                        .borrow()
+                        .send_frames(self.start_time.elapsed());
+                }
+            }
+        }
     }
+}
+
+fn render_surface(
+    surface: &mut SurfaceData,
+    renderer: &mut Gles2Renderer,
+    device_id: dev_t,
+    crtc: crtc::Handle,
+    window_map: &mut WindowMap,
+    output_map: &OutputMap,
+    pointer_location: Point<f64, Logical>,
+    pointer_image: &Gles2Texture,
+    #[cfg(feature = "debug")] fps_texture: &Gles2Texture,
+    drag_icon: &Option<WlSurface>,
+    cursor_status: &mut CursorImageStatus,
+    log: &Logger,
+) -> Result<(), SwapBuffersError> {
+    surface.surface.frame_submitted()?;
+
+    let output_id = UdevOutputId { device_id, crtc };
+    let output = output_map.find(|o| o.userdata().get::<UdevOutputId>() == Some(&output_id));
+    let (geometry, scale, mode) = match output {
+        Some(o) => (o.geometry(), o.scale(), o.current_mode()),
+        None => return Ok(()),
+    };
+
+    let dmabuf = surface.surface.next_buffer()?;
+    renderer.bind(dmabuf)?;
+    let rendering = |renderer: &mut _, frame: &mut Gles2Frame| -> Result<(), SwapBuffersError> {
+        frame.clear([0.8, 0.8, 0.9, 1.0])?;
+        macro_rules! r_f {
+            () => {
+                (&mut *renderer, &mut *frame)
+            };
+        }
+        draw_windows(r_f!(), window_map, geometry, scale, log)?;
+
+        if geometry.to_f64().contains(pointer_location) {
+            let relative_ptr_location = pointer_location.to_i32_round() - geometry.loc;
+
+            if let Some(surface) = drag_icon {
+                if surface.as_ref().is_alive() {
+                    draw_drag_icon(r_f!(), surface, relative_ptr_location, scale, log)?;
+                }
+            }
+
+            if let CursorImageStatus::Image(surface) = cursor_status {
+                if !surface.as_ref().is_alive() {
+                    *cursor_status = CursorImageStatus::Default;
+                }
+            }
+
+            if let CursorImageStatus::Image(surface) = cursor_status {
+                draw_cursor(r_f!(), surface, relative_ptr_location, scale, log)?;
+            } else {
+                frame.render_texture_at(
+                    pointer_image,
+                    relative_ptr_location
+                        .to_f64()
+                        .to_physical(scale as f64)
+                        .to_i32_round(),
+                    1,
+                    scale as f64,
+                    Transform::Normal,
+                    1.0,
+                )?;
+            }
+        }
+
+        #[cfg(feature = "debug")]
+        {
+            let fps = &mut surface.fps;
+            draw_fps(r_f!(), fps_texture, scale as f64, fps.avg().round() as u32)?;
+            fps.tick();
+        }
+        Ok(())
+    };
+
+    renderer.render(mode.size, Transform::Flipped180, rendering)??;
+    surface.surface.queue_buffer()?;
+    Ok(())
 }

@@ -3,16 +3,25 @@ name = "wm"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["debug"]
+debug = ["fps_ticker"]
+
 [dependencies]
 slog = "2.7.0"
 slog-term = "2.8.1"
 sugars = "3.0.1"
+either = "1.6.1"
+xcursor = "0.3.4"
+image = "0.24.0"
+fps_ticker = { version = "1.0.0", optional = true }
 
 [dependencies.smithay]
 version = "0.3.0"
 default-features = false
 features = [
     "backend_drm",
+    "backend_gbm",
     "backend_libinput",
     "backend_session_logind",
     "backend_udev",
