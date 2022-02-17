@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use smithay::backend::{
     renderer::{
         gles2::{Gles2Error, Gles2Renderer, Gles2Texture},
@@ -60,6 +62,9 @@ pub fn draw_drag_icon<'r, 'e>(
     todo!()
 }
 
+#[cfg(feature = "debug")]
+pub static FPS_NUMBERS_PNG: &[u8] = include_bytes!("../resources/numbers.png");
+
 pub fn draw_windows<'r, 'e>(
     _r_f: impl RendererAndFrame<'r, 'e>,
     _window_map: &WindowMap,
@@ -80,9 +85,9 @@ pub fn draw_fps<'r, 'e, RF: RendererAndFrame<'r, 'e>>(
     todo!()
 }
 
-pub fn import_bitmap(
+pub fn import_bitmap<C: Deref<Target = [u8]>>(
     renderer: &mut Gles2Renderer,
-    image: &ImageBuffer<Rgba<u8>, &[u8]>,
+    image: &ImageBuffer<Rgba<u8>, C>,
 ) -> Result<Gles2Texture, Gles2Error> {
     use smithay::backend::renderer::gles2::ffi;
 

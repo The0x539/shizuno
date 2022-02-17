@@ -21,11 +21,13 @@ version = "0.3.0"
 default-features = false
 features = [
     "backend_drm",
+    "backend_egl",
     "backend_gbm",
     "backend_libinput",
     "backend_session_logind",
     "backend_udev",
     "renderer_gl",
+    "use_system_lib",
     "wayland_frontend",
     "xwayland",
 ]

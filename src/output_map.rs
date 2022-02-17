@@ -1,12 +1,25 @@
 use smithay::reexports::*;
 use smithay::utils::{Logical, Rectangle};
 
-use smithay::wayland::output::Mode;
+use smithay::wayland::output::{Mode, PhysicalProperties};
 use wayland_commons::user_data::UserDataMap;
 
 pub struct OutputMap;
 
 impl OutputMap {
+    pub fn add<N: AsRef<str>>(
+        &mut self,
+        _name: N,
+        _props: PhysicalProperties,
+        _mode: Mode,
+    ) -> &Output {
+        todo!()
+    }
+
+    pub fn retain<F: FnMut(&Output) -> bool>(&mut self, _f: F) {
+        todo!()
+    }
+
     pub fn find<F: FnMut(&&Output) -> bool>(&self, _f: F) -> Option<&Output> {
         todo!()
     }
