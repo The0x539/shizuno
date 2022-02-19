@@ -8,6 +8,15 @@ macro_rules! cb {
     };
 }
 
+macro_rules! try_or {
+    ($or:expr, $try:expr) => {
+        match $try {
+            Some(v) => v,
+            None => $or,
+        }
+    };
+}
+
 pub trait PseudoCell {
     type Contents;
     fn set(&self, value: Self::Contents);

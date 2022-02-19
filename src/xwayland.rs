@@ -19,3 +19,6 @@ impl<B> State<B> {
         todo!()
     }
 }
+
+#[derive(Clone)]
+pub struct X11Surface;
