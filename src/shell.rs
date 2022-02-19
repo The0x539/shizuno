@@ -1,11 +1,11 @@
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{any::Any, cell::RefCell, rc::Rc, time::Duration};
 
 use smithay::reexports::*;
 use smithay::utils::{Logical, Point, Size};
 use smithay::wayland::compositor::SurfaceAttributes;
 
 use slog::Logger;
-use wayland_server::Display;
+use wayland_server::{protocol::wl_buffer::WlBuffer, Display};
 
 use crate::{output_map::OutputMap, window_map::WindowMap};
 
@@ -20,7 +20,11 @@ impl ShellHandles {
     }
 }
 
-pub struct SurfaceData;
+pub struct SurfaceData {
+    pub buffer: Option<WlBuffer>,
+    pub texture: Option<Box<dyn Any + 'static>>,
+    pub buffer_scale: i32,
+}
 
 impl SurfaceData {
     pub fn size(&self) -> Option<Size<i32, Logical>> {

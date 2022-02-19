@@ -204,6 +204,13 @@ impl WindowMap {
         }
     }
 
+    pub fn geometry(&self, toplevel: &Kind) -> Option<Rectangle<i32, Logical>> {
+        self.windows
+            .iter()
+            .find(|w| &w.toplevel == toplevel)
+            .map(|w| w.geometry())
+    }
+
     pub fn send_frames(&self, time: Duration) {
         for window in &self.windows {
             window.send_frame(time);
