@@ -1,3 +1,8 @@
+use smithay::reexports::*;
+use smithay::wayland::compositor::SurfaceData;
+
+use wayland_server::protocol::wl_surface::WlSurface;
+
 macro_rules! cb {
     () => {
         |_, _, _| ()
@@ -62,4 +67,17 @@ impl<T> PseudoCell for std::sync::Mutex<T> {
     {
         *self.lock().unwrap()
     }
+}
+
+pub fn with_surface_tree_downward_all(
+    wl_surface: &WlSurface,
+    mut f: impl FnMut(&WlSurface, &SurfaceData),
+) {
+    smithay::wayland::compositor::with_surface_tree_downward(
+        wl_surface,
+        (),
+        |_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+        |wl_surface, states, &()| f(wl_surface, states),
+        |_, _, &()| true,
+    );
 }

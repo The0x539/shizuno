@@ -19,7 +19,8 @@ use wayland_server::{
 };
 
 use crate::shell::SurfaceData;
-use crate::window_map::{Kind, WindowMap};
+use crate::util::with_surface_tree_downward_all;
+use crate::window_map::{Kind, SurfaceTrait, WindowMap};
 
 pub struct OutputMap {
     display: Rc<RefCell<Display>>,
@@ -372,13 +373,9 @@ impl Output {
 
             with_surface_tree_downward(surface, location, filter, processor, |_, _, _| true)
         } else {
-            with_surface_tree_downward(
-                surface,
-                (),
-                |_, _, _| TraversalAction::DoChildren(()),
-                |wl_surface, _, _| self.remove_if_present(wl_surface),
-                |_, _, _| true,
-            );
+            with_surface_tree_downward_all(surface, |wl_surface, _| {
+                self.remove_if_present(wl_surface)
+            });
         }
     }
 
