@@ -551,7 +551,7 @@ impl State<UdevData> {
 
             let pointer_image = backend
                 .pointer_images
-                .entry(Rc::as_ptr(&frame))
+                .entry(frame as *const Image)
                 .or_insert_with(|| {
                     let image =
                         ImageBuffer::from_raw(frame.width, frame.height, &*frame.pixels_rgba)

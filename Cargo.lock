@@ -1225,6 +1225,7 @@ dependencies = [
  "slog-term",
  "smithay",
  "sugars",
+ "thiserror",
  "xcursor",
 ]
 
