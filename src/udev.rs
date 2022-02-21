@@ -73,7 +73,7 @@ struct UdevOutputId {
 }
 
 pub struct UdevData {
-    session: AutoSession,
+    pub session: AutoSession,
     gpu: Option<PathBuf>,
     backends: HashMap<dev_t, BackendData>,
     signaler: Signaler<SessionSignal>,

@@ -1247,6 +1247,7 @@ dependencies = [
  "thiserror",
  "x11rb",
  "xcursor",
+ "xkbcommon",
 ]
 
 [[package]]

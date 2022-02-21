@@ -166,7 +166,7 @@ impl OutputMap {
         self.outputs.is_empty()
     }
 
-    fn with_primary(&self) -> Option<&Output> {
+    pub fn with_primary(&self) -> Option<&Output> {
         self.outputs.get(0)
     }
 

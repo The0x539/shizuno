@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -37,12 +38,13 @@ pub struct State<B> {
     pub drag_icon: Rc<RefCell<Option<WlSurface>>>,
     pub log: Logger,
 
-    pointer: PointerHandle,
-    keyboard: KeyboardHandle,
+    pub pointer: PointerHandle,
+    pub keyboard: KeyboardHandle,
+    pub suppressed_keys: HashSet<u32>,
     pub pointer_location: Point<f64, Logical>,
     pub seat_name: String,
     pub cursor_status: Rc<RefCell<CursorImageStatus>>,
-    seat: Seat,
+    pub seat: Seat,
     pub start_time: Instant,
 
     pub xwayland: XWayland<Self>,
@@ -164,6 +166,7 @@ impl<B: Backend + 'static> State<B> {
 
             pointer,
             keyboard,
+            suppressed_keys: HashSet::new(),
             pointer_location: Default::default(),
             cursor_status,
             seat_name,
