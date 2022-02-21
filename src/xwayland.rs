@@ -1,28 +1,215 @@
-use std::os::unix::net::UnixStream;
+use std::{cell::RefCell, collections::HashMap, os::unix::net::UnixStream, rc::Rc};
 
 use smithay::reexports::*;
+use smithay::utils::{Logical, Point};
+use smithay::wayland::compositor::give_role;
 
+use slog::{debug, error, info, Logger};
 use wayland_server::{protocol::wl_surface::WlSurface, Client};
+use x11rb::{
+    connection::Connection,
+    errors::ReplyOrIdError,
+    protocol::{
+        composite::{ConnectionExt as _, Redirect},
+        xproto::{
+            ChangeWindowAttributesAux, ConfigWindow, ConfigureWindowAux, ConnectionExt as _,
+            EventMask, Window, WindowClass,
+        },
+        Event,
+    },
+    rust_connection::{DefaultStream, RustConnection},
+};
 
-use crate::{state::State, window_map::SurfaceTrait};
+use crate::{
+    state::State,
+    window_map::{SurfaceTrait, WindowMap},
+};
 
-impl<B> State<B> {
+mod x11rb_event_source;
+use x11rb_event_source::X11Source;
+
+impl<B: 'static> State<B> {
     pub fn start_xwayland(&mut self) {
-        todo!()
+        if let Err(e) = self.xwayland.start() {
+            error!(self.log, "Failed to start XWayland: {e}");
+        }
     }
 
-    pub fn xwayland_ready(&mut self, _connection: UnixStream, _client: Client) {
-        todo!()
+    pub fn xwayland_ready(&mut self, connection: UnixStream, client: Client) {
+        let (wm, source) =
+            X11State::start_wm(connection, self.window_map.clone(), self.log.clone()).unwrap();
+        let wm = Rc::new(RefCell::new(wm));
+        client.data_map().insert_if_missing(|| wm.clone());
+        let f = cb!(events, _ => {
+            let mut wm = wm.borrow_mut();
+            for event in events {
+                wm.handle_event(event, &client)?;
+            }
+            Ok(())
+        });
+        self.handle.insert_source(source, f).unwrap();
     }
 
     pub fn xwayland_exited(&mut self) {
-        todo!()
+        error!(self.log, "Xwayland crashed");
     }
 }
 
-#[derive(Clone, PartialEq)]
+x11rb::atom_manager! {
+    Atoms: AtomsCookie {
+        WM_S0,
+        WL_SURFACE_ID,
+    }
+}
+
+struct X11State {
+    conn: Rc<RustConnection>,
+    atoms: Atoms,
+    log: Logger,
+    unpaired_surfaces: HashMap<u32, (Window, Point<i32, Logical>)>,
+    window_map: Rc<RefCell<WindowMap>>,
+}
+
+impl X11State {
+    fn start_wm(
+        connection: UnixStream,
+        window_map: Rc<RefCell<WindowMap>>,
+        log: Logger,
+    ) -> Result<(Self, X11Source), Box<dyn std::error::Error>> {
+        let screen = 0;
+        let stream = DefaultStream::from_unix_stream(connection)?;
+        let conn = RustConnection::connect_to_stream(stream, screen)?;
+        let atoms = Atoms::new(&conn)?.reply()?;
+
+        let screen = &conn.setup().roots[0];
+
+        let attrs = ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_REDIRECT);
+        conn.change_window_attributes(screen.root, &attrs)?;
+
+        let win = conn.generate_id()?;
+        conn.create_window(
+            screen.root_depth,
+            win,
+            screen.root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &Default::default(),
+        )?;
+        conn.set_selection_owner(win, atoms.WM_S0, x11rb::CURRENT_TIME)?;
+
+        conn.composite_redirect_subwindows(screen.root, Redirect::MANUAL)?;
+
+        conn.flush()?;
+
+        let conn = Rc::new(conn);
+        let wm = Self {
+            conn: conn.clone(),
+            atoms,
+            log,
+            unpaired_surfaces: Default::default(),
+            window_map,
+        };
+
+        Ok((wm, X11Source::new(conn)))
+    }
+
+    fn handle_event(&mut self, event: Event, client: &Client) -> Result<(), ReplyOrIdError> {
+        debug!(self.log, "X11: Got event {event:?}");
+
+        match event {
+            Event::ConfigureRequest(r) => {
+                let mut aux = ConfigureWindowAux::new();
+                macro_rules! field {
+                    ($field:ident, $flag:ident) => {
+                        if r.value_mask & u16::from(ConfigWindow::$flag) != 0 {
+                            aux.$field = Some(r.$field.try_into().unwrap());
+                        }
+                    };
+                }
+
+                field!(stack_mode, STACK_MODE);
+                field!(sibling, SIBLING);
+                field!(x, X);
+                field!(y, Y);
+                field!(width, WIDTH);
+                field!(height, HEIGHT);
+                field!(border_width, BORDER_WIDTH);
+
+                self.conn.configure_window(r.window, &aux)?;
+            }
+            Event::MapRequest(r) => {
+                self.conn.map_window(r.window)?;
+            }
+            Event::ClientMessage(msg) if msg.type_ == self.atoms.WL_SURFACE_ID => {
+                let win = msg.window;
+                let location = match self.conn.get_geometry(msg.window)?.reply() {
+                    Ok(geo) => (geo.x as i32, geo.y as i32).into(),
+                    Err(e) => {
+                        error!(
+                            self.log,
+                            "Failed to get geometry for {win:x}, perhaps the window was already destroyed?";
+                            "err" => format!("{e:?}"),
+                        );
+                        (0, 0).into()
+                    }
+                };
+
+                let id = msg.data.as_data32()[0];
+                let surface = client.get_resource::<WlSurface>(id);
+                info!(
+                    self.log,
+                    "X11 surface {win:x?} corresponds to WlSurface {id:x} = {surface:?}",
+                );
+
+                if let Some(surface) = surface {
+                    self.new_window(msg.window, surface, location)
+                } else {
+                    self.unpaired_surfaces.insert(id, (msg.window, location));
+                }
+            }
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    fn new_window(&mut self, window: Window, surface: WlSurface, location: Point<i32, Logical>) {
+        debug!(self.log, "Matched X11 surface {window:x?} to {surface:x?}");
+
+        if give_role(&surface, "x11_surface").is_err() {
+            error!(self.log, "Surface {surface:x?} already has a role‽");
+            return;
+        }
+
+        self.window_map
+            .borrow_mut()
+            .insert(X11Surface { surface }.into(), location);
+    }
+}
+
+pub fn commit_hook(surface: &WlSurface) {
+    let client = try_or!(return, surface.as_ref().client());
+    let x11 = try_or!(return, client.data_map().get::<Rc<RefCell<X11State>>>());
+    let mut inner = x11.borrow_mut();
+    let id = surface.as_ref().id();
+    let (window, location) = try_or!(return, inner.unpaired_surfaces.remove(&id));
+    inner.new_window(window, surface.clone(), location);
+}
+
+#[derive(Clone)]
 pub struct X11Surface {
     surface: WlSurface,
+}
+
+impl std::cmp::PartialEq for X11Surface {
+    fn eq(&self, other: &Self) -> bool {
+        self.alive() && other.alive() && self.surface == other.surface
+    }
 }
 
 impl SurfaceTrait for X11Surface {

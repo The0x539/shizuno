@@ -45,7 +45,7 @@ pub struct State<B> {
     seat: Seat,
     pub start_time: Instant,
 
-    xwayland: XWayland<Self>,
+    pub xwayland: XWayland<Self>,
 }
 
 impl<B: Backend + 'static> State<B> {

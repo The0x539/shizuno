@@ -8,7 +8,7 @@ macro_rules! cb {
         |_, _, _| ()
     };
 
-    ($event:pat, $state:ident => $body:expr) => {
+    ($event:pat, $state:pat => $body:expr) => {
         move |$event, _: &mut _, $state: &mut $crate::state::State<_>| $body
     };
 }
