@@ -177,6 +177,7 @@ impl OutputMap {
         self.find(|o| o.output.owns(output))
     }
 
+    #[allow(dead_code)] // only used in winit
     pub fn find_by_name<N: AsRef<str>>(&self, name: N) -> Option<&Output> {
         let name = name.as_ref();
         self.find(|o| o.name == name)
@@ -257,6 +258,7 @@ impl OutputMap {
         self.update_by_name(None, Some(scale), name)
     }
 
+    #[allow(dead_code)] // only used in winit
     pub fn update_mode_by_name<N: AsRef<str>>(&mut self, mode: Mode, name: N) {
         self.update_by_name(Some(mode), None, name)
     }

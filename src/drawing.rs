@@ -56,6 +56,14 @@ struct BufferTextures<T> {
     texture: T,
 }
 
+impl<T> Drop for BufferTextures<T> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            buffer.release();
+        }
+    }
+}
+
 pub fn draw_cursor<'r, 'e>(
     r_f: impl RendererAndFrame<'r, 'e>,
     surface: &WlSurface,

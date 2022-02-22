@@ -115,6 +115,7 @@ impl WindowMap {
         self.windows.insert(0, window);
     }
 
+    #[allow(dead_code)] // only used in... wlcs_anvil?
     pub fn windows(&self) -> impl Iterator<Item = Kind> + '_ {
         self.windows.iter().map(|w| w.toplevel.clone())
     }

@@ -28,7 +28,7 @@ pub trait Backend {
 
 pub struct State<B> {
     pub backend_data: B,
-    socket_name: Option<String>,
+    pub socket_name: Option<String>,
     pub running: Cell<bool>,
     pub display: Rc<RefCell<Display>>,
     pub handle: LoopHandle<'static, Self>,

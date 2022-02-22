@@ -303,8 +303,8 @@ impl From<ResizeEdge> for xdg_toplevel::ResizeEdge {
 }
 
 pub struct ShellHandles {
-    xdg_state: Arc<Mutex<XdgShellState>>,
-    wl_state: Arc<Mutex<WlShellState>>,
+    pub xdg_state: Arc<Mutex<XdgShellState>>,
+    pub wl_state: Arc<Mutex<WlShellState>>,
     pub window_map: Rc<RefCell<WindowMap>>,
     pub output_map: Rc<RefCell<OutputMap>>,
 }
