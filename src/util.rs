@@ -14,7 +14,7 @@ macro_rules! cb {
 }
 
 macro_rules! try_or {
-    ($or:expr, $try:expr) => {
+    ($or:expr, $try:expr $(,)?) => {
         match $try {
             Some(v) => v,
             None => $or,
@@ -74,6 +74,19 @@ pub fn with_surface_tree_downward_all(
     mut f: impl FnMut(&WlSurface, &SurfaceData),
 ) {
     smithay::wayland::compositor::with_surface_tree_downward(
+        wl_surface,
+        (),
+        |_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+        |wl_surface, states, &()| f(wl_surface, states),
+        |_, _, &()| true,
+    );
+}
+
+pub fn with_surface_tree_upward_all(
+    wl_surface: &WlSurface,
+    mut f: impl FnMut(&WlSurface, &SurfaceData),
+) {
+    smithay::wayland::compositor::with_surface_tree_upward(
         wl_surface,
         (),
         |_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),

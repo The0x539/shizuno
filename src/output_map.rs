@@ -29,7 +29,6 @@ pub struct OutputMap {
     log: Logger,
 }
 
-#[allow(dead_code)]
 impl OutputMap {
     pub fn new(
         display: Rc<RefCell<Display>>,

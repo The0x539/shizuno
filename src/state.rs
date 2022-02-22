@@ -26,7 +26,6 @@ pub trait Backend {
     fn seat_name(&self) -> String;
 }
 
-#[allow(dead_code)]
 pub struct State<B> {
     pub backend_data: B,
     socket_name: Option<String>,
@@ -84,6 +83,7 @@ impl<B: Backend + 'static> State<B> {
         let ShellHandles {
             window_map,
             output_map,
+            ..
         } = ShellHandles::init::<B>(display_rc.clone(), log.clone());
 
         init_xdg_output_manager(display, log.clone());

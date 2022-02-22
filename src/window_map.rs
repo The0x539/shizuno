@@ -66,6 +66,7 @@ impl Kind {
     }
 }
 
+#[derive(Clone)]
 #[enum_dispatch(SurfaceTrait)]
 pub enum PopupKind {
     Xdg(PopupSurface),
@@ -96,6 +97,7 @@ impl PopupKind {
     }
 }
 
+#[derive(Default)]
 pub struct WindowMap {
     windows: Vec<Window>,
     popups: Vec<Popup>,
@@ -176,6 +178,12 @@ impl WindowMap {
         }
     }
 
+    pub fn refresh_toplevel(&mut self, toplevel: &Kind) {
+        if let Some(w) = self.windows.iter_mut().find(|w| &w.toplevel == toplevel) {
+            w.self_update();
+        }
+    }
+
     pub fn clear(&mut self) {
         self.windows.clear();
     }
@@ -185,6 +193,16 @@ impl WindowMap {
             let s = try_or!(continue, window.toplevel.get_surface());
             if s.as_ref().equals(surface.as_ref()) {
                 return Some(window.toplevel.clone());
+            }
+        }
+        None
+    }
+
+    pub fn find_popup(&self, surface: &WlSurface) -> Option<PopupKind> {
+        for p in &self.popups {
+            let s = try_or!(continue, p.popup.get_surface());
+            if s.as_ref().equals(surface.as_ref()) {
+                return Some(p.popup.clone());
             }
         }
         None
