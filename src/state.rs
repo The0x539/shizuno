@@ -51,17 +51,15 @@ pub struct State<B> {
 
 impl<B: Backend + 'static> State<B> {
     pub fn init(
-        display_rc: Rc<RefCell<Display>>,
+        display: Rc<RefCell<Display>>,
         handle: LoopHandle<'static, Self>,
         backend_data: B,
         log: Logger,
         listen_on_socket: bool,
     ) -> Self {
-        let display = display_rc.clone();
-        let display = &mut display.borrow_mut();
-
         {
-            let event_source = Generic::from_fd(display.get_poll_fd(), Interest::READ, Mode::Level);
+            let event_source =
+                Generic::from_fd(display.borrow().get_poll_fd(), Interest::READ, Mode::Level);
             let cb = cb!(_, state => {
                 let display = state.display.clone();
                 let dispatch_result = display.borrow_mut().dispatch(Duration::ZERO, state);
@@ -78,17 +76,18 @@ impl<B: Backend + 'static> State<B> {
                 .expect("failed to init wayland event source");
         }
 
-        shm::init_shm_global(display, vec![], log.clone());
+        shm::init_shm_global(&mut display.borrow_mut(), vec![], log.clone());
 
         let ShellHandles {
             window_map,
             output_map,
             ..
-        } = ShellHandles::init::<B>(display_rc.clone(), log.clone());
+        } = ShellHandles::init::<B>(display.clone(), log.clone());
 
-        init_xdg_output_manager(display, log.clone());
+        init_xdg_output_manager(&mut display.borrow_mut(), log.clone());
 
         let socket_name = if listen_on_socket {
+            let mut display = display.borrow_mut();
             let name = display.add_socket_auto().unwrap().into_string().unwrap();
             info!(log, "Listening on wayland socket"; "name" => &name);
             std::env::set_var("WAYLAND_DISPLAY", &name);
@@ -106,11 +105,16 @@ impl<B: Backend + 'static> State<B> {
                 DataDeviceEvent::DnDDropped => drag_icon.set(None),
                 _ => (),
             };
-            init_data_device(display, cb, default_action_chooser, log.clone());
+            init_data_device(
+                &mut display.borrow_mut(),
+                cb,
+                default_action_chooser,
+                log.clone(),
+            );
         }
 
         let seat_name = backend_data.seat_name();
-        let (mut seat, _) = Seat::new(display, seat_name.clone(), log.clone());
+        let (mut seat, _) = Seat::new(&mut display.borrow_mut(), seat_name.clone(), log.clone());
 
         let cursor_status = Rc::new(RefCell::new(CursorImageStatus::Default));
 
@@ -121,7 +125,7 @@ impl<B: Backend + 'static> State<B> {
         };
 
         {
-            init_tablet_manager_global(display);
+            init_tablet_manager_global(&mut display.borrow_mut());
             let cursor_status = cursor_status.clone();
             let cb = move |_tool: &_, status| cursor_status.set(status);
             seat.tablet_seat().on_cursor_surface(cb);
@@ -136,8 +140,7 @@ impl<B: Backend + 'static> State<B> {
         };
 
         let xwayland = {
-            let (xwayland, channel) =
-                XWayland::new(handle.clone(), display_rc.clone(), log.clone());
+            let (xwayland, channel) = XWayland::new(handle.clone(), display.clone(), log.clone());
             let cb = |event, _: &mut _, state: &mut Self| match event {
                 XWaylandEvent::Ready { connection, client } => {
                     state.xwayland_ready(connection, client)
@@ -157,7 +160,7 @@ impl<B: Backend + 'static> State<B> {
             backend_data,
             socket_name,
             running: Default::default(),
-            display: display_rc,
+            display,
             handle,
             window_map,
             output_map,
