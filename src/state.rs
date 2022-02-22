@@ -159,7 +159,7 @@ impl<B: Backend + 'static> State<B> {
         Self {
             backend_data,
             socket_name,
-            running: Default::default(),
+            running: true.into(),
             display,
             handle,
             window_map,
