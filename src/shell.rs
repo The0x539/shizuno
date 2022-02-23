@@ -469,8 +469,26 @@ fn xdg_shell_impl(
                 .insert(surface.into(), (x, y).into());
         }
 
-        XdgRequest::NewPopup { surface } => {
+        XdgRequest::NewPopup {
+            surface,
+            positioner: _,
+        } => {
             window_map.borrow_mut().insert_popup(surface.into());
+        }
+
+        XdgRequest::RePosition {
+            surface,
+            positioner,
+            token,
+        } => {
+            // TODO: calculate real popup geometry
+            let res = surface.with_pending_state(|state| {
+                state.geometry = positioner.get_geometry();
+                state.positioner = positioner;
+            });
+            if res.is_ok() {
+                surface.send_repositioned(token);
+            }
         }
 
         XdgRequest::Move {
