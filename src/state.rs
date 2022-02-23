@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use smithay::reexports::*;
@@ -13,12 +14,13 @@ use smithay::wayland::{
     seat::{CursorImageStatus, KeyboardHandle, PointerHandle, Seat},
     shm,
     tablet_manager::{init_tablet_manager_global, TabletSeatTrait},
+    xdg_activation::{init_xdg_activation_global, XdgActivationEvent, XdgActivationState},
 };
 use smithay::xwayland::{XWayland, XWaylandEvent};
 
 use calloop::{generic::Generic, Interest, LoopHandle, Mode, PostAction};
 use slog::{error, info, Logger};
-use wayland_server::{protocol::wl_surface::WlSurface, Display};
+use wayland_server::{protocol::wl_surface::WlSurface, DispatchData, Display};
 
 use crate::{output_map::OutputMap, shell::ShellHandles, util::PseudoCell, window_map::WindowMap};
 
@@ -85,6 +87,11 @@ impl<B: Backend + 'static> State<B> {
         } = ShellHandles::init::<B>(display.clone(), log.clone());
 
         init_xdg_output_manager(&mut display.borrow_mut(), log.clone());
+        init_xdg_activation_global(
+            &mut display.borrow_mut(),
+            xdg_activation_global_impl::<B>,
+            log.clone(),
+        );
 
         let socket_name = if listen_on_socket {
             let mut display = display.borrow_mut();
@@ -178,5 +185,30 @@ impl<B: Backend + 'static> State<B> {
 
             xwayland,
         }
+    }
+}
+
+fn xdg_activation_global_impl<B: 'static>(
+    state: &Mutex<XdgActivationState>,
+    req: XdgActivationEvent,
+    mut ddata: DispatchData<'_>,
+) {
+    let wm_state = ddata.get::<State<B>>().unwrap();
+    match req {
+        XdgActivationEvent::RequestActivation {
+            token,
+            token_data,
+            surface,
+        } => {
+            if token_data.timestamp.elapsed().as_secs() < 10 {
+                wm_state
+                    .window_map
+                    .borrow_mut()
+                    .bring_surface_to_top(&surface);
+            } else {
+                state.lock().unwrap().remove_request(&token);
+            }
+        }
+        XdgActivationEvent::DestroyActivationRequest { .. } => {}
     }
 }

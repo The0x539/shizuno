@@ -152,6 +152,26 @@ impl WindowMap {
         None
     }
 
+    pub fn bring_surface_to_top(&mut self, surface: &WlSurface) {
+        // TODO: deduplicate code
+        let mut found = None;
+        for (i, w) in self.windows.iter().enumerate() {
+            if let Some(s) = w.toplevel.get_surface() {
+                if s.as_ref().equals(surface.as_ref()) {
+                    found = Some(i);
+                }
+            }
+        }
+        let i = try_or!(return, found);
+
+        for (j, window) in self.windows.iter().enumerate() {
+            window.toplevel.set_activated(i == j);
+        }
+
+        let winner = self.windows.remove(i);
+        self.windows.insert(0, winner);
+    }
+
     pub fn get_surface_and_bring_to_top(
         &mut self,
         point: Point<f64, Logical>,
