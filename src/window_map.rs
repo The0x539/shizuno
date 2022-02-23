@@ -152,49 +152,38 @@ impl WindowMap {
         None
     }
 
+    fn bring_nth_window_to_top(&mut self, id: usize) {
+        let win = self.windows.remove(id);
+        self.windows.insert(0, win);
+        self.windows[0].toplevel.set_activated(true);
+
+        for window in &self.windows[1..] {
+            window.toplevel.set_activated(false);
+        }
+    }
+
     pub fn bring_surface_to_top(&mut self, surface: &WlSurface) {
-        // TODO: deduplicate code
-        let mut found = None;
         for (i, w) in self.windows.iter().enumerate() {
             if let Some(s) = w.toplevel.get_surface() {
                 if s.as_ref().equals(surface.as_ref()) {
-                    found = Some(i);
+                    self.bring_nth_window_to_top(i);
+                    return;
                 }
             }
         }
-        let i = try_or!(return, found);
-
-        for (j, window) in self.windows.iter().enumerate() {
-            window.toplevel.set_activated(i == j);
-        }
-
-        let winner = self.windows.remove(i);
-        self.windows.insert(0, winner);
     }
 
     pub fn get_surface_and_bring_to_top(
         &mut self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
-        let mut found = None;
         for (i, window) in self.windows.iter().enumerate() {
             if let Some(surface) = window.matching(point) {
-                found = Some((i, surface));
-                break;
+                self.bring_nth_window_to_top(i);
+                return Some(surface);
             }
         }
-        let (i, surface) = found?;
-
-        // activate the winner and only the winner
-        for (j, window) in self.windows.iter().enumerate() {
-            window.toplevel.set_activated(i == j);
-        }
-
-        // move the winner to the front of the list
-        let winner = self.windows.remove(i);
-        self.windows.insert(0, winner);
-
-        Some(surface)
+        None
     }
 
     pub fn with_windows_from_bottom_to_top<F>(&self, mut f: F)
