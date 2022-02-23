@@ -471,8 +471,13 @@ fn xdg_shell_impl(
 
         XdgRequest::NewPopup {
             surface,
-            positioner: _,
+            positioner,
         } => {
+            // TODO: properly recompute geometry
+            // TODO: "this is not really necessary"
+            surface
+                .with_pending_state(|state| state.geometry = positioner.get_geometry())
+                .unwrap();
             window_map.borrow_mut().insert_popup(surface.into());
         }
 
@@ -995,8 +1000,7 @@ fn surface_commit(
     if let Some(popup) = window_map.find_popup(surface) {
         let PopupKind::Xdg(popup) = popup;
         if !ics!(XdgPopupSurfaceRoleAttributes) {
-            // TODO: properly recompute the geometry with the whole of positioner state
-            popup.send_configure();
+            popup.send_configure().unwrap();
         }
     }
 
