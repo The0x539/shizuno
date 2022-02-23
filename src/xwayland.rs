@@ -1,7 +1,7 @@
-use std::{cell::RefCell, collections::HashMap, os::unix::net::UnixStream, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, os::unix::net::UnixStream, rc::Rc, sync::Arc};
 
 use smithay::reexports::*;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{x11rb::X11Source, Logical, Point};
 use smithay::wayland::compositor::give_role;
 
 use slog::{debug, error, info, Logger};
@@ -25,9 +25,6 @@ use crate::{
     window_map::{SurfaceTrait, WindowMap},
 };
 
-mod x11rb_event_source;
-use x11rb_event_source::X11Source;
-
 impl<B: 'static> State<B> {
     pub fn start_xwayland(&mut self) {
         if let Err(e) = self.xwayland.start() {
@@ -40,12 +37,11 @@ impl<B: 'static> State<B> {
             X11State::start_wm(connection, self.window_map.clone(), self.log.clone()).unwrap();
         let wm = Rc::new(RefCell::new(wm));
         client.data_map().insert_if_missing(|| wm.clone());
-        let f = cb!(events, _ => {
-            let mut wm = wm.borrow_mut();
-            for event in events {
-                wm.handle_event(event, &client)?;
-            }
-            Ok(())
+        let log = self.log.clone();
+        let f = cb!(event, _ => {
+            if let Err(e) = wm.borrow_mut().handle_event(event, &client) {
+            error!(log, "Error while handling X11 event: {e}");
+        }
         });
         self.handle.insert_source(source, f).unwrap();
     }
@@ -59,11 +55,12 @@ x11rb::atom_manager! {
     Atoms: AtomsCookie {
         WM_S0,
         WL_SURFACE_ID,
+        ANVIL_CLOSE_CONNECTION,
     }
 }
 
 struct X11State {
-    conn: Rc<RustConnection>,
+    conn: Arc<RustConnection>,
     atoms: Atoms,
     log: Logger,
     unpaired_surfaces: HashMap<u32, (Window, Point<i32, Logical>)>,
@@ -106,16 +103,19 @@ impl X11State {
 
         conn.flush()?;
 
-        let conn = Rc::new(conn);
+        let conn = Arc::new(conn);
         let wm = Self {
             conn: conn.clone(),
             atoms,
-            log,
+            log: log.clone(),
             unpaired_surfaces: Default::default(),
             window_map,
         };
 
-        Ok((wm, X11Source::new(conn)))
+        Ok((
+            wm,
+            X11Source::new(conn, win, atoms.ANVIL_CLOSE_CONNECTION, log),
+        ))
     }
 
     fn handle_event(&mut self, event: Event, client: &Client) -> Result<(), ReplyOrIdError> {

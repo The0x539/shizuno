@@ -19,14 +19,14 @@ fps_ticker = { version = "1.0.0", optional = true }
 enum_dispatch = "0.3.8"
 once_cell = "1.9.0"
 thiserror = "1.0.30"
-x11rb = { version = "0.9.0", features = ["composite"] }
+x11rb = { version = "0.9.0", default-features = false, features = ["composite"] }
 xkbcommon = "0.4.0"
 rand = "0.8.5"
 bitflags = "1.3.2"
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
-rev = "8114bac8fd78d9f2a44732f3570d0d11bbfa3d69"
+rev = "2e68cfda5a7e2dc6a5fc54b331b12a53a903672a"
 default-features = false
 features = [
     "backend_drm",
@@ -35,6 +35,7 @@ features = [
     "backend_libinput",
     "backend_session_logind",
     "backend_udev",
+    "backend_x11",
     "renderer_gl",
     "use_system_lib",
     "wayland_frontend",
