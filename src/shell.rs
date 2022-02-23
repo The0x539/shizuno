@@ -342,7 +342,7 @@ impl ShellHandles {
             log.clone(),
         );
 
-        let (xdg_state, _, _) = xdg_shell_init(display, xdg_shell_impl::<B>, log.clone());
+        let (xdg_state, _) = xdg_shell_init(display, xdg_shell_impl::<B>, log.clone());
         let (wl_state, _) = wl_shell_init(display, wl_shell_impl::<B>, log.clone());
         wlr_layer_shell_init(display, wlr_layer_shell_impl::<B>, log.clone());
 
