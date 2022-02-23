@@ -306,8 +306,6 @@ impl From<ResizeEdge> for xdg_toplevel::ResizeEdge {
 pub struct ShellHandles {
     pub xdg_state: Arc<Mutex<XdgShellState>>,
     pub wl_state: Arc<Mutex<WlShellState>>,
-    pub window_map: Rc<RefCell<WindowMap>>,
-    pub output_map: Rc<RefCell<OutputMap>>,
 }
 
 fn fullscreen_output_geometry(
@@ -334,8 +332,9 @@ fn fullscreen_output_geometry(
 
 impl ShellHandles {
     pub fn init<B: 'static>(display: Rc<RefCell<Display>>, log: Logger) -> Self {
+        let display = &mut display.borrow_mut();
         compositor_init(
-            &mut display.borrow_mut(),
+            display,
             move |surface, mut ddata| {
                 let state = ddata.get::<State<B>>().unwrap();
                 surface_commit(&surface, &state.window_map, &state.output_map);
@@ -343,50 +342,13 @@ impl ShellHandles {
             log.clone(),
         );
 
-        let window_map: Rc<RefCell<WindowMap>> = Default::default();
-        let output_map = Rc::new(RefCell::new(OutputMap::new(
-            display.clone(),
-            window_map.clone(),
-            log.clone(),
-        )));
-
-        let (xdg_state, _, _) = {
-            let window_map = window_map.clone();
-            let output_map = output_map.clone();
-            xdg_shell_init(
-                &mut display.borrow_mut(),
-                move |shell_event, _| xdg_shell_impl(&window_map, &output_map, shell_event),
-                log.clone(),
-            )
-        };
-
-        let (wl_state, _) = {
-            let window_map = window_map.clone();
-            let output_map = output_map.clone();
-            wl_shell_init(
-                &mut display.borrow_mut(),
-                move |req, _| wl_shell_impl(&window_map, &output_map, req),
-                log.clone(),
-            )
-        };
-
-        {
-            let window_map = window_map.clone();
-            let output_map = output_map.clone();
-            wlr_layer_shell_init(
-                &mut display.borrow_mut(),
-                move |event, ddata| {
-                    wlr_layer_shell_impl::<B>(&window_map, &output_map, event, ddata)
-                },
-                log.clone(),
-            );
-        }
+        let (xdg_state, _, _) = xdg_shell_init(display, xdg_shell_impl::<B>, log.clone());
+        let (wl_state, _) = wl_shell_init(display, wl_shell_impl::<B>, log.clone());
+        wlr_layer_shell_init(display, wlr_layer_shell_impl::<B>, log.clone());
 
         Self {
             xdg_state,
             wl_state,
-            window_map,
-            output_map,
         }
     }
 }
@@ -443,16 +405,13 @@ impl SurfaceData {
     }
 }
 
-fn xdg_shell_impl(
-    window_map: &Rc<RefCell<WindowMap>>,
-    output_map: &RefCell<OutputMap>,
-    shell_event: XdgRequest,
-) {
+fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'_>) {
+    let state = ddata.get::<State<B>>().unwrap();
     match shell_event {
         XdgRequest::NewToplevel { surface } => {
             use rand::distributions::{Distribution, Uniform};
 
-            let geometry = match output_map.borrow().with_primary() {
+            let geometry = match state.output_map.borrow().with_primary() {
                 Some(o) => o.geometry(),
                 None => Rectangle::from_loc_and_size((0, 0), (800, 800)),
             };
@@ -464,7 +423,8 @@ fn xdg_shell_impl(
             let mut rng = rand::thread_rng();
             let x = x_range.sample(&mut rng);
             let y = y_range.sample(&mut rng);
-            window_map
+            state
+                .window_map
                 .borrow_mut()
                 .insert(surface.into(), (x, y).into());
         }
@@ -478,7 +438,7 @@ fn xdg_shell_impl(
             surface
                 .with_pending_state(|state| state.geometry = positioner.get_geometry())
                 .unwrap();
-            window_map.borrow_mut().insert_popup(surface.into());
+            state.window_map.borrow_mut().insert_popup(surface.into());
         }
 
         XdgRequest::RePosition {
@@ -520,7 +480,8 @@ fn xdg_shell_impl(
             }
 
             let toplevel = surface.clone().into();
-            let mut initial_window_location = window_map.borrow().location(&toplevel).unwrap();
+            let mut initial_window_location =
+                state.window_map.borrow().location(&toplevel).unwrap();
 
             if let Some(cur_state) = surface.current_state() {
                 if cur_state.states.contains(xdg_toplevel::State::Maximized) {
@@ -546,7 +507,7 @@ fn xdg_shell_impl(
 
             let grab = MoveSurfaceGrab {
                 start_data,
-                window_map: window_map.clone(),
+                window_map: state.window_map.clone(),
                 toplevel,
                 initial_window_location,
             };
@@ -579,8 +540,8 @@ fn xdg_shell_impl(
             }
 
             let toplevel = surface.clone().into();
-            let initial_window_location = window_map.borrow().location(&toplevel).unwrap();
-            let geometry = window_map.borrow().geometry(&toplevel).unwrap();
+            let initial_window_location = state.window_map.borrow().location(&toplevel).unwrap();
+            let geometry = state.window_map.borrow().geometry(&toplevel).unwrap();
             let initial_window_size = geometry.size;
 
             let edges = edges.into();
@@ -663,12 +624,12 @@ fn xdg_shell_impl(
                 fullscreen_output_geometry(
                     wl_surface,
                     output.as_ref(),
-                    &window_map.borrow(),
-                    &output_map.borrow(),
+                    &state.window_map.borrow(),
+                    &state.output_map.borrow(),
                 ),
             );
 
-            let mut window_map = window_map.borrow_mut();
+            let mut window_map = state.window_map.borrow_mut();
             if let Some(kind) = window_map.find(wl_surface) {
                 window_map.set_location(&kind, geometry.loc);
             }
@@ -698,13 +659,13 @@ fn xdg_shell_impl(
             // NOTE: This should use layer-shell when it is implemented
             // to get the correct maximum size
 
-            let mut window_map = window_map.borrow_mut();
+            let mut window_map = state.window_map.borrow_mut();
 
             let wl_surface = try_or!(return, surface.get_surface());
             let kind = try_or!(return, window_map.find(wl_surface));
 
             let geometry = {
-                let output_map = output_map.borrow();
+                let output_map = state.output_map.borrow();
 
                 let position = try_or!(return, window_map.location(&kind));
                 let output = try_or!(return, output_map.find_by_position(position));
@@ -736,11 +697,8 @@ fn xdg_shell_impl(
     }
 }
 
-fn wl_shell_impl(
-    window_map: &Rc<RefCell<WindowMap>>,
-    output_map: &RefCell<OutputMap>,
-    req: ShellRequest,
-) {
+fn wl_shell_impl<B: 'static>(req: ShellRequest, mut ddata: DispatchData<'_>) {
+    let state = ddata.get::<State<B>>().unwrap();
     match req {
         ShellRequest::SetKind {
             surface,
@@ -750,7 +708,7 @@ fn wl_shell_impl(
             // or if there is not output in a [0;800]x[0;800] square
             use rand::distributions::{Distribution, Uniform};
 
-            let geometry = match output_map.borrow().with_primary() {
+            let geometry = match state.output_map.borrow().with_primary() {
                 Some(o) => o.geometry(),
                 None => Rectangle::from_loc_and_size((0, 0), (800, 800)),
             };
@@ -762,7 +720,8 @@ fn wl_shell_impl(
             let mut rng = rand::thread_rng();
             let x = x_range.sample(&mut rng);
             let y = y_range.sample(&mut rng);
-            window_map
+            state
+                .window_map
                 .borrow_mut()
                 .insert(SurfaceKind::Wl(surface), (x, y).into());
         }
@@ -778,12 +737,15 @@ fn wl_shell_impl(
             let geometry = fullscreen_output_geometry(
                 wl_surface,
                 output.as_ref(),
-                &window_map.borrow(),
-                &output_map.borrow(),
+                &state.window_map.borrow(),
+                &state.output_map.borrow(),
             );
 
             if let Some(geometry) = geometry {
-                window_map.borrow_mut().insert(surface.into(), geometry.loc);
+                state
+                    .window_map
+                    .borrow_mut()
+                    .insert(surface.into(), geometry.loc);
             }
         }
         ShellRequest::Move {
@@ -810,11 +772,11 @@ fn wl_shell_impl(
             }
 
             let toplevel = surface.into();
-            let initial_window_location = window_map.borrow().location(&toplevel).unwrap();
+            let initial_window_location = state.window_map.borrow().location(&toplevel).unwrap();
 
             let grab = MoveSurfaceGrab {
                 start_data,
-                window_map: window_map.clone(),
+                window_map: state.window_map.clone(),
                 toplevel,
                 initial_window_location,
             };
@@ -846,8 +808,8 @@ fn wl_shell_impl(
             }
 
             let toplevel = surface.clone().into();
-            let initial_window_location = window_map.borrow().location(&toplevel).unwrap();
-            let geometry = window_map.borrow().geometry(&toplevel).unwrap();
+            let initial_window_location = state.window_map.borrow().location(&toplevel).unwrap();
+            let geometry = state.window_map.borrow().geometry(&toplevel).unwrap();
             let initial_window_size = geometry.size;
             let edges = edges.into();
 
@@ -875,12 +837,7 @@ fn wl_shell_impl(
     }
 }
 
-fn wlr_layer_shell_impl<B: 'static>(
-    window_map: &RefCell<WindowMap>,
-    output_map: &RefCell<OutputMap>,
-    event: LayerShellRequest,
-    mut ddata: DispatchData<'_>,
-) {
+fn wlr_layer_shell_impl<B: 'static>(event: LayerShellRequest, mut ddata: DispatchData<'_>) {
     match event {
         LayerShellRequest::NewLayerSurface {
             surface,
@@ -888,8 +845,8 @@ fn wlr_layer_shell_impl<B: 'static>(
             layer,
             namespace: _,
         } => {
-            let output_map = output_map.borrow();
             let state = ddata.get::<State<B>>().unwrap();
+            let output_map = state.output_map.borrow();
 
             let output = output
                 .and_then(|o| output_map.find_by_output(&o))
@@ -899,7 +856,7 @@ fn wlr_layer_shell_impl<B: 'static>(
 
             let wl_surface = try_or!(return, surface.get_surface());
             output.add_layer_surface(wl_surface.clone());
-            window_map.borrow_mut().layers.insert(surface, layer);
+            state.window_map.borrow_mut().layers.insert(surface, layer);
         }
         LayerShellRequest::AckConfigure { .. } => (),
     }

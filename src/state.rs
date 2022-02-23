@@ -78,13 +78,16 @@ impl<B: Backend + 'static> State<B> {
                 .expect("failed to init wayland event source");
         }
 
+        let window_map: Rc<RefCell<WindowMap>> = Default::default();
+        let output_map = Rc::new(RefCell::new(OutputMap::new(
+            display.clone(),
+            window_map.clone(),
+            log.clone(),
+        )));
+
         shm::init_shm_global(&mut display.borrow_mut(), vec![], log.clone());
 
-        let ShellHandles {
-            window_map,
-            output_map,
-            ..
-        } = ShellHandles::init::<B>(display.clone(), log.clone());
+        ShellHandles::init::<B>(display.clone(), log.clone());
 
         init_xdg_output_manager(&mut display.borrow_mut(), log.clone());
         init_xdg_activation_global(
