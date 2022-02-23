@@ -316,7 +316,7 @@ fn fullscreen_output_geometry(
     output_map: &OutputMap,
 ) -> Option<Rectangle<i32, Logical>> {
     if let Some(wl_output) = wl_output {
-        return output_map.find_by_output(&wl_output).map(|o| o.geometry());
+        return output_map.find_by_output(wl_output).map(|o| o.geometry());
     }
 
     if let Some(location) = window_map
@@ -338,7 +338,7 @@ impl ShellHandles {
             move |surface, mut ddata| {
                 let state = ddata.get::<State<B>>().unwrap();
                 let window_map = state.window_map.as_ref();
-                surface_commit(&surface, &window_map);
+                surface_commit(&surface, window_map);
             },
             log.clone(),
         );

@@ -106,7 +106,8 @@ impl OutputMap {
                 windows_to_move.push((kind.clone(), geometry.loc));
             }
 
-            if let Ok(_) = xdg.with_pending_state(|state| state.size = Some(geometry.size)) {
+            let res = xdg.with_pending_state(|state| state.size = Some(geometry.size));
+            if res.is_ok() {
                 xdg.send_configure();
             }
         });
@@ -197,7 +198,7 @@ impl OutputMap {
         scale: Option<f32>,
         mut f: F,
     ) {
-        let output = try_or!(return, self.outputs.iter_mut().find(|o| f(&o)));
+        let output = try_or!(return, self.outputs.iter_mut().find(|o| f(o)));
 
         if let Some(mode) = mode {
             output.output.delete_mode(output.current_mode);

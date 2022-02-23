@@ -567,7 +567,7 @@ impl State<UdevData> {
                 &mut self.window_map.borrow_mut(),
                 &self.output_map.borrow(),
                 self.pointer_location,
-                &pointer_image,
+                pointer_image,
                 #[cfg(feature = "debug")]
                 &backend.fps_texture,
                 &self.drag_icon.borrow(),
@@ -606,6 +606,7 @@ impl State<UdevData> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_surface(
     surface: &mut SurfaceData,
     renderer: &mut Gles2Renderer,

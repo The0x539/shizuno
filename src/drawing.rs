@@ -230,7 +230,7 @@ pub fn draw_windows<'r, 'e>(
 
         if let Err(e) = draw_surface_tree(
             (&mut *renderer, &mut *frame),
-            &wl_surface,
+            wl_surface,
             initial_place,
             output_scale,
             log,
@@ -240,13 +240,13 @@ pub fn draw_windows<'r, 'e>(
 
         let toplevel_geometry_offset = window_map.geometry(root_surface).unwrap_or_default().loc;
 
-        window_map.with_child_popups(&wl_surface, |popup| {
+        window_map.with_child_popups(wl_surface, |popup| {
             let draw_location = initial_place + popup.location() + toplevel_geometry_offset;
             let wl_surface = try_or!(return, popup.get_surface());
 
             if let Err(e) = draw_surface_tree(
                 (&mut *renderer, &mut *frame),
-                &wl_surface,
+                wl_surface,
                 draw_location,
                 output_scale,
                 log,
