@@ -7,6 +7,7 @@ mod cursor;
 mod drawing;
 mod input_handler;
 mod output_map;
+mod render;
 mod shell;
 mod state;
 pub mod udev;

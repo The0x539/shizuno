@@ -26,7 +26,6 @@ use smithay::wayland::{
     dmabuf::init_dmabuf_global,
     output::{Mode, PhysicalProperties},
     seat::CursorImageStatus,
-    shell::wlr_layer::Layer,
 };
 
 use calloop::{
@@ -50,6 +49,7 @@ use wayland_server::{
 };
 use xcursor::parser::Image;
 
+use crate::render::render_layers_and_windows;
 use crate::util::PseudoCell;
 use crate::{
     cursor::Cursor,
@@ -634,18 +634,13 @@ fn render_surface(
     let dmabuf = surface.surface.next_buffer()?;
     renderer.bind(dmabuf)?;
     let rendering = |renderer: &mut _, frame: &mut Gles2Frame| -> Result<(), SwapBuffersError> {
-        frame.clear([0.8, 0.8, 0.9, 1.0])?;
         macro_rules! r_f {
             () => {
                 (&mut *renderer, &mut *frame)
             };
         }
 
-        draw_layers(r_f!(), window_map, Layer::Background, geometry, scale, log)?;
-        draw_layers(r_f!(), window_map, Layer::Bottom, geometry, scale, log)?;
-        draw_windows(r_f!(), window_map, geometry, scale, log)?;
-        draw_layers(r_f!(), window_map, Layer::Top, geometry, scale, log)?;
-        draw_layers(r_f!(), window_map, Layer::Overlay, geometry, scale, log)?;
+        render_layers_and_windows(renderer, frame, window_map, geometry, scale, log)?;
 
         if geometry.to_f64().contains(pointer_location) {
             let relative_ptr_location = pointer_location.to_i32_round() - geometry.loc;
@@ -677,13 +672,14 @@ fn render_surface(
                     1.0,
                 )?;
             }
-        }
 
-        #[cfg(feature = "debug")]
-        {
-            let fps = &mut surface.fps;
-            draw_fps(r_f!(), fps_texture, scale as f64, fps.avg().round() as u32)?;
-            fps.tick();
+            // Not sure why this got moved to inside the conditional.
+            #[cfg(feature = "debug")]
+            {
+                let fps = &mut surface.fps;
+                draw_fps(r_f!(), fps_texture, scale as f64, fps.avg().round() as u32)?;
+                fps.tick();
+            }
         }
         Ok(())
     };
