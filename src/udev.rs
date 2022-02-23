@@ -594,13 +594,13 @@ impl State<UdevData> {
                     self.backend_data
                         .render_timer
                         .add_timeout(dur!(1 sec) / 60, (backend.dev_id, crtc));
-                } else {
-                    // TODO: only send drawn windows the frames callback
-                    // Send frame events so that client start drawing their next frame
-                    self.window_map
-                        .borrow()
-                        .send_frames(self.start_time.elapsed());
                 }
+            } else {
+                // TODO: only send drawn windows the frames callback
+                // Send frame events so that client start drawing their next frame
+                self.window_map
+                    .borrow()
+                    .send_frames(self.start_time.elapsed());
             }
         }
     }
