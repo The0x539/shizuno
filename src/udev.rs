@@ -26,6 +26,7 @@ use smithay::wayland::{
     dmabuf::init_dmabuf_global,
     output::{Mode, PhysicalProperties},
     seat::CursorImageStatus,
+    shell::wlr_layer::Layer,
 };
 
 use calloop::{
@@ -639,7 +640,12 @@ fn render_surface(
                 (&mut *renderer, &mut *frame)
             };
         }
+
+        draw_layers(r_f!(), window_map, Layer::Background, geometry, scale, log)?;
+        draw_layers(r_f!(), window_map, Layer::Bottom, geometry, scale, log)?;
         draw_windows(r_f!(), window_map, geometry, scale, log)?;
+        draw_layers(r_f!(), window_map, Layer::Top, geometry, scale, log)?;
+        draw_layers(r_f!(), window_map, Layer::Overlay, geometry, scale, log)?;
 
         if geometry.to_f64().contains(pointer_location) {
             let relative_ptr_location = pointer_location.to_i32_round() - geometry.loc;

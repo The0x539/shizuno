@@ -84,6 +84,10 @@ impl OutputMap {
             window_map.set_location(&window, location);
         }
 
+        for output in &self.outputs {
+            window_map.layers.arrange_layers(output);
+        }
+
         window_map.with_windows_from_bottom_to_top(|kind, location, _| {
             let xdg = match kind {
                 Kind::Xdg(v) => v,
@@ -178,6 +182,15 @@ impl OutputMap {
         self.find(|o| o.output.owns(output))
     }
 
+    pub fn find_by_layer_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        self.find(|o| {
+            o.layer_surfaces
+                .borrow()
+                .iter()
+                .any(|s| s.as_ref().equals(surface.as_ref()))
+        })
+    }
+
     #[allow(dead_code)] // only used in winit
     pub fn find_by_name<N: AsRef<str>>(&self, name: N) -> Option<&Output> {
         let name = name.as_ref();
@@ -266,7 +279,9 @@ impl OutputMap {
 
     pub fn refresh(&mut self) {
         for output in &mut self.outputs {
-            output.surfaces.retain(|s| s.as_ref().is_alive());
+            let p = |s: &WlSurface| s.as_ref().is_alive();
+            output.surfaces.retain(p);
+            output.layer_surfaces.borrow_mut().retain(p);
         }
 
         let window_map = self.window_map.clone();
@@ -286,6 +301,7 @@ pub struct Output {
     output: output::Output,
     global: Option<Global<wl_output::WlOutput>>,
     surfaces: Vec<WlSurface>,
+    layer_surfaces: RefCell<Vec<WlSurface>>,
     current_mode: Mode,
     scale: f32,
     output_scale: i32,
@@ -317,6 +333,7 @@ impl Output {
             output,
             location,
             surfaces: Vec::new(),
+            layer_surfaces: Default::default(),
             current_mode: mode,
             scale,
             output_scale,
@@ -414,6 +431,14 @@ impl Output {
 
     pub fn current_mode(&self) -> Mode {
         self.current_mode
+    }
+
+    pub fn add_layer_surface(&self, layer: WlSurface) {
+        self.layer_surfaces.borrow_mut().push(layer);
+    }
+
+    pub fn layer_surfaces(&self) -> std::cell::Ref<'_, Vec<WlSurface>> {
+        self.layer_surfaces.borrow()
     }
 }
 

@@ -14,6 +14,7 @@ use smithay::wayland::{
     seat::{AxisFrame, GrabStartData, PointerGrab, PointerInnerHandle, Seat},
     shell::{
         legacy::{wl_shell_init, ShellRequest, ShellState as WlShellState, ShellSurfaceKind},
+        wlr_layer::{wlr_layer_shell_init, LayerShellRequest, LayerSurfaceAttributes},
         xdg::{
             xdg_shell_init, Configure, ShellState as XdgShellState, SurfaceCachedState,
             XdgPopupSurfaceRoleAttributes, XdgRequest, XdgToplevelSurfaceRoleAttributes,
@@ -30,7 +31,7 @@ use wayland_server::{
         wl_buffer::WlBuffer, wl_output::WlOutput, wl_pointer::ButtonState, wl_shell_surface,
         wl_surface::WlSurface,
     },
-    Display,
+    DispatchData, Display,
 };
 
 use crate::util::with_surface_tree_upward_all;
@@ -337,8 +338,7 @@ impl ShellHandles {
             &mut display.borrow_mut(),
             move |surface, mut ddata| {
                 let state = ddata.get::<State<B>>().unwrap();
-                let window_map = state.window_map.as_ref();
-                surface_commit(&surface, window_map);
+                surface_commit(&surface, &state.window_map, &state.output_map);
             },
             log.clone(),
         );
@@ -369,6 +369,18 @@ impl ShellHandles {
                 log.clone(),
             )
         };
+
+        {
+            let window_map = window_map.clone();
+            let output_map = output_map.clone();
+            wlr_layer_shell_init(
+                &mut display.borrow_mut(),
+                move |event, ddata| {
+                    wlr_layer_shell_impl::<B>(&window_map, &output_map, event, ddata)
+                },
+                log.clone(),
+            );
+        }
 
         Self {
             xdg_state,
@@ -433,7 +445,7 @@ impl SurfaceData {
 
 fn xdg_shell_impl(
     window_map: &Rc<RefCell<WindowMap>>,
-    output_map: &Rc<RefCell<OutputMap>>,
+    output_map: &RefCell<OutputMap>,
     shell_event: XdgRequest,
 ) {
     match shell_event {
@@ -703,7 +715,7 @@ fn xdg_shell_impl(
 
 fn wl_shell_impl(
     window_map: &Rc<RefCell<WindowMap>>,
-    output_map: &Rc<RefCell<OutputMap>>,
+    output_map: &RefCell<OutputMap>,
     req: ShellRequest,
 ) {
     match req {
@@ -840,7 +852,41 @@ fn wl_shell_impl(
     }
 }
 
-fn surface_commit(surface: &WlSurface, window_map: &RefCell<WindowMap>) {
+fn wlr_layer_shell_impl<B: 'static>(
+    window_map: &RefCell<WindowMap>,
+    output_map: &RefCell<OutputMap>,
+    event: LayerShellRequest,
+    mut ddata: DispatchData<'_>,
+) {
+    match event {
+        LayerShellRequest::NewLayerSurface {
+            surface,
+            output,
+            layer,
+            namespace: _,
+        } => {
+            let output_map = output_map.borrow();
+            let state = ddata.get::<State<B>>().unwrap();
+
+            let output = output
+                .and_then(|o| output_map.find_by_output(&o))
+                .or_else(|| output_map.find_by_position(state.pointer_location.to_i32_round()))
+                .or_else(|| output_map.with_primary())
+                .unwrap();
+
+            let wl_surface = try_or!(return, surface.get_surface());
+            output.add_layer_surface(wl_surface.clone());
+            window_map.borrow_mut().layers.insert(surface, layer);
+        }
+        LayerShellRequest::AckConfigure { .. } => (),
+    }
+}
+
+fn surface_commit(
+    surface: &WlSurface,
+    window_map: &RefCell<WindowMap>,
+    output_map: &RefCell<OutputMap>,
+) {
     super::xwayland::commit_hook(surface);
     let mut window_map = window_map.borrow_mut();
 
@@ -858,19 +904,19 @@ fn surface_commit(surface: &WlSurface, window_map: &RefCell<WindowMap>) {
         });
     }
 
+    macro_rules! ics {
+        ($t:ty) => {
+            with_states(surface, |states| {
+                let attrs = states.data_map.get::<Mutex<$t>>().unwrap();
+                attrs.lock().unwrap().initial_configure_sent
+            })
+            .unwrap()
+        };
+    }
+
     if let Some(toplevel) = window_map.find(surface) {
         if let SurfaceKind::Xdg(toplevel) = &toplevel {
-            let initial_configure_sent = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<Mutex<XdgToplevelSurfaceRoleAttributes>>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .initial_configure_sent
-            })
-            .unwrap();
-            if !initial_configure_sent {
+            if !ics!(XdgToplevelSurfaceRoleAttributes) {
                 toplevel.send_configure();
             }
         }
@@ -930,19 +976,19 @@ fn surface_commit(surface: &WlSurface, window_map: &RefCell<WindowMap>) {
 
     if let Some(popup) = window_map.find_popup(surface) {
         let PopupKind::Xdg(popup) = popup;
-        let initial_configure_sent = with_states(surface, |states| {
-            states
-                .data_map
-                .get::<Mutex<XdgPopupSurfaceRoleAttributes>>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .initial_configure_sent
-        })
-        .unwrap();
-        if !initial_configure_sent {
+        if !ics!(XdgPopupSurfaceRoleAttributes) {
             // TODO: properly recompute the geometry with the whole of positioner state
             popup.send_configure();
+        }
+    }
+
+    if let Some(layer) = window_map.layers.find(surface) {
+        if !ics!(LayerSurfaceAttributes) {
+            layer.surface.send_configure();
+        }
+
+        if let Some(output) = output_map.borrow().find_by_layer_surface(surface) {
+            window_map.layers.arrange_layers(output);
         }
     }
 }

@@ -16,14 +16,17 @@ use smithay::wayland::{
         SurfaceAttributes, TraversalAction,
     },
     seat::CursorImageAttributes,
+    shell::wlr_layer::Layer,
 };
 
 use image::{ImageBuffer, Rgba};
 use slog::{error, warn, Logger};
 use wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 
-use crate::window_map::WindowMap;
-use crate::{shell::SurfaceData, window_map::SurfaceTrait};
+use crate::{
+    shell::SurfaceData,
+    window_map::{LayerSurface, SurfaceTrait, WindowMap},
+};
 
 // TODO: a more general "draw context bundle" kinda struct.
 // these functions' signatures are very similar.
@@ -187,6 +190,59 @@ fn draw_surface_tree<'r, 'e, Tex: 'static>(
         },
         |_, _, _| true,
     );
+
+    result
+}
+
+pub fn draw_layers<'r, 'e>(
+    r_f: impl RendererAndFrame<'r, 'e>,
+    window_map: &WindowMap,
+    layer: Layer,
+    output_rect: Rectangle<i32, Logical>,
+    output_scale: f32,
+    log: &Logger,
+) -> Result<(), SwapBuffersError> {
+    let (renderer, frame) = r_f.pair();
+
+    let mut result = Ok(());
+    let f = |layer_surface: &LayerSurface| {
+        // skip layers that do not overlap with a given output
+        if !output_rect.overlaps(layer_surface.bbox) {
+            return;
+        }
+
+        let mut initial_place: Point<i32, Logical> = layer_surface.location;
+        initial_place.x -= output_rect.loc.x;
+
+        let wl_surface = try_or!(return, layer_surface.surface.get_surface());
+
+        if let Err(e) = draw_surface_tree(
+            (&mut *renderer, &mut *frame),
+            wl_surface,
+            initial_place,
+            output_scale,
+            log,
+        ) {
+            result = Err(e);
+        }
+
+        window_map.with_child_popups(wl_surface, |popup| {
+            let location = popup.location();
+            let draw_location = initial_place + location;
+            let wl_surface = try_or!(return, popup.get_surface());
+            if let Err(e) = draw_surface_tree(
+                (&mut *renderer, &mut *frame),
+                wl_surface,
+                draw_location,
+                output_scale,
+                log,
+            ) {
+                result = Err(e);
+            }
+        });
+    };
+
+    window_map.layers.with_layers_from_bottom_to_top(&layer, f);
 
     result
 }

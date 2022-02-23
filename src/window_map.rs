@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use smithay::reexports::*;
 use smithay::utils::{Logical, Point, Rectangle};
+use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::{
     compositor::{with_states, with_surface_tree_downward, SubsurfaceCachedState, TraversalAction},
     shell::{
@@ -20,6 +21,10 @@ use wayland_server::protocol::wl_surface::WlSurface;
 use crate::shell::SurfaceData;
 use crate::util::with_surface_tree_downward_all;
 use crate::xwayland::X11Surface;
+
+mod layer_map;
+use layer_map::LayerMap;
+pub use layer_map::LayerSurface;
 
 #[enum_dispatch]
 pub trait SurfaceTrait {
@@ -101,6 +106,8 @@ impl PopupKind {
 pub struct WindowMap {
     windows: Vec<Window>,
     popups: Vec<Popup>,
+
+    pub layers: LayerMap,
 }
 
 impl WindowMap {
@@ -128,7 +135,21 @@ impl WindowMap {
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
-        self.windows.iter().find_map(|w| w.matching(point))
+        macro_rules! check {
+            ($x:expr) => {
+                if let Some(res) = $x {
+                    return Some(res);
+                }
+            };
+        }
+
+        check!(self.layers.get_surface_under(&Layer::Overlay, point));
+        check!(self.layers.get_surface_under(&Layer::Top, point));
+        check!(self.windows.iter().find_map(|w| w.matching(point)));
+        check!(self.layers.get_surface_under(&Layer::Bottom, point));
+        check!(self.layers.get_surface_under(&Layer::Background, point));
+
+        None
     }
 
     pub fn get_surface_and_bring_to_top(
@@ -176,6 +197,7 @@ impl WindowMap {
     pub fn refresh(&mut self) {
         self.windows.retain(|w| w.toplevel.alive());
         self.popups.retain(|p| p.popup.alive());
+        self.layers.refresh();
         for w in &mut self.windows {
             w.self_update();
         }
@@ -236,6 +258,7 @@ impl WindowMap {
         for window in &self.windows {
             window.send_frame(time);
         }
+        self.layers.send_frames(time);
     }
 }
 
