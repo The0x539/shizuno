@@ -12,7 +12,7 @@ use smithay::backend::{
 use smithay::reexports::*;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::{
-    seat::{AxisFrame, ModifiersState},
+    seat::{AxisFrame, FilterResult, ModifiersState},
     tablet_manager::TabletSeatTrait,
     Serial,
 };
@@ -35,7 +35,6 @@ enum KeyAction {
     Screen(usize),
     ScaleUp,
     ScaleDown,
-    Forward,
     None,
 }
 
@@ -45,30 +44,39 @@ impl<B> State<B> {
         let state = evt.state();
         debug!(self.log, "key"; "keycode" => keycode, "state" => format!("{state:?}"));
 
-        let mut action = KeyAction::None;
-
-        let filter = |modifiers: &_, keysym| {
-            debug!(self.log, "keysym";
-                "state" => format!("{state:?}"),
-                "mods" => format!("{modifiers:?}"),
-                "keysym" => xkbcommon::xkb::keysym_get_name(keysym)
-            );
-
-            if state == KeyState::Pressed {
-                action = process_keyboard_shortcut(*modifiers, keysym);
-                if action != KeyAction::Forward {
-                    self.suppressed_keys.insert(keysym);
-                }
-                action == KeyAction::Forward
-            } else {
-                let was_suppressed = self.suppressed_keys.remove(&keysym);
-                !was_suppressed
-            }
-        };
-
         self.keyboard
-            .input(keycode, state, scounter(), evt.time(), filter);
-        action
+            .input(
+                keycode,
+                state,
+                scounter(),
+                evt.time(),
+                // TODO: de-inline this closure again once it's possible to name `handle`'s datatype
+                |modifiers, handle| {
+                    let keysym = handle.modified_sym();
+
+                    debug!(self.log, "keysym";
+                        "state" => format!("{state:?}"),
+                        "mods" => format!("{modifiers:?}"),
+                        "keysym" => xkbcommon::xkb::keysym_get_name(keysym)
+                    );
+
+                    if state == KeyState::Pressed {
+                        if let Some(action) = process_keyboard_shortcut(*modifiers, keysym) {
+                            self.suppressed_keys.insert(keysym);
+                            FilterResult::Intercept(action)
+                        } else {
+                            FilterResult::Forward
+                        }
+                    } else {
+                        if self.suppressed_keys.remove(&keysym) {
+                            FilterResult::Intercept(KeyAction::None)
+                        } else {
+                            FilterResult::Forward
+                        }
+                    }
+                },
+            )
+            .unwrap_or(KeyAction::None)
     }
 
     fn change_scale(&mut self, delta: f32) {
@@ -196,7 +204,7 @@ impl State<UdevData> {
                 }
                 KeyAction::ScaleUp => self.change_scale(0.25),
                 KeyAction::ScaleDown => self.change_scale(-0.25),
-                KeyAction::Forward | KeyAction::None => (),
+                KeyAction::None => (),
             },
 
             InputEvent::PointerMotion { event } => self.on_pointer_move::<I>(event),
@@ -349,7 +357,7 @@ impl State<UdevData> {
     }
 }
 
-fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> KeyAction {
+fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Option<KeyAction> {
     use xkbcommon::xkb;
 
     let mods = (
@@ -358,19 +366,25 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> KeyAc
         modifiers.alt,
         modifiers.shift,
     );
-    match (mods, keysym) {
+    let action = match (mods, keysym) {
         ((true, _, true, _), xkb::KEY_BackSpace) | ((_, true, _, _), xkb::KEY_q) => KeyAction::Quit,
+
         (_, xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12) => {
             let vt = keysym - xkb::KEY_XF86Switch_VT_1 + 1;
             KeyAction::VtSwitch(vt as i32)
         }
+
         ((_, true, _, _), xkb::KEY_Return) => KeyAction::Run("alacritty".into()),
+
         ((_, true, _, _), xkb::KEY_1..=xkb::KEY_9) => {
             let num = keysym - xkb::KEY_1;
             KeyAction::Screen(num as usize)
         }
+
         ((_, true, _, true), xkb::KEY_M) => KeyAction::ScaleDown,
         ((_, true, _, true), xkb::KEY_P) => KeyAction::ScaleUp,
-        _ => KeyAction::Forward,
-    }
+
+        _ => return None,
+    };
+    Some(action)
 }
