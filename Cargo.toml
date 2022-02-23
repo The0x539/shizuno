@@ -24,7 +24,8 @@ rand = "0.8.5"
 bitflags = "1.3.2"
 
 [dependencies.smithay]
-version = "0.3.0"
+git = "https://github.com/Smithay/smithay"
+rev = "115403633b2f0cc1bd8c4ddd5cd5d62a9ac27efc"
 default-features = false
 features = [
     "backend_drm",
