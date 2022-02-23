@@ -135,12 +135,14 @@ impl WindowMap {
         &mut self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
-        let (i, surface) = self
-            .windows
-            .iter()
-            .filter_map(|window| window.matching(point))
-            .enumerate()
-            .next()?;
+        let mut found = None;
+        for (i, window) in self.windows.iter().enumerate() {
+            if let Some(surface) = window.matching(point) {
+                found = Some((i, surface));
+                break;
+            }
+        }
+        let (i, surface) = found?;
 
         // activate the winner and only the winner
         for (j, window) in self.windows.iter().enumerate() {

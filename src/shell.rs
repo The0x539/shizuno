@@ -419,7 +419,8 @@ impl SurfaceData {
         if !rect.contains(point) {
             return false;
         }
-        let input_region = try_or!(return false, attrs.input_region.as_ref());
+        // if there's no input region, then the entire window works
+        let input_region = try_or!(return true, attrs.input_region.as_ref());
         input_region.contains(point.to_i32_floor())
     }
 
