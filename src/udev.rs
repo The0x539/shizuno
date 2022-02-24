@@ -88,7 +88,7 @@ impl Backend for UdevData {
     }
 }
 
-pub type RenderSurface = GbmBufferedSurface<SessionFd>;
+pub type RenderSurface = GbmBufferedSurface<GbmDevice<SessionFd>, SessionFd>;
 
 struct SurfaceData {
     surface: RenderSurface,

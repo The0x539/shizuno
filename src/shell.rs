@@ -52,12 +52,14 @@ struct MoveSurfaceGrab {
 impl PointerGrab for MoveSurfaceGrab {
     fn motion(
         &mut self,
-        _handle: &mut PointerInnerHandle<'_>,
+        handle: &mut PointerInnerHandle<'_>,
         location: Point<f64, Logical>,
         _focus: Option<(WlSurface, Point<i32, Logical>)>,
-        _serial: Serial,
-        _time: u32,
+        serial: Serial,
+        time: u32,
     ) {
+        handle.motion(location, None, serial, time);
+
         let delta = location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
         self.window_map.borrow_mut().set_location(
@@ -111,6 +113,8 @@ impl PointerGrab for ResizeSurfaceGrab {
             handle.unset_grab(serial, time);
             return;
         }
+
+        handle.motion(location, None, serial, time);
 
         let (mut dx, mut dy) = (location - self.start_data.location).into();
 
@@ -514,7 +518,7 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
                 initial_window_location,
             };
 
-            pointer.set_grab(grab, serial);
+            pointer.set_grab(grab, serial, 0);
         }
 
         XdgRequest::Resize {
@@ -565,7 +569,7 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
                 last_window_size: initial_window_size,
             };
 
-            pointer.set_grab(grab, serial);
+            pointer.set_grab(grab, serial, 0);
         }
 
         XdgRequest::AckConfigure {
@@ -783,7 +787,7 @@ fn wl_shell_impl<B: 'static>(req: ShellRequest, mut ddata: DispatchData<'_>) {
                 initial_window_location,
             };
 
-            pointer.set_grab(grab, serial);
+            pointer.set_grab(grab, serial, 0);
         }
         ShellRequest::Resize {
             surface,
@@ -833,7 +837,7 @@ fn wl_shell_impl<B: 'static>(req: ShellRequest, mut ddata: DispatchData<'_>) {
                 last_window_size: initial_window_size,
             };
 
-            pointer.set_grab(grab, serial);
+            pointer.set_grab(grab, serial, 0);
         }
         _ => (),
     }

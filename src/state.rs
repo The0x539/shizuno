@@ -114,7 +114,7 @@ impl<B: Backend + 'static> State<B> {
             let drag_icon = drag_icon.clone();
             let cb = move |event| match event {
                 DataDeviceEvent::DnDStarted { icon, .. } => drag_icon.set(icon),
-                DataDeviceEvent::DnDDropped => drag_icon.set(None),
+                DataDeviceEvent::DnDDropped { .. } => drag_icon.set(None),
                 _ => (),
             };
             init_data_device(display, cb, default_action_chooser, log.clone());
