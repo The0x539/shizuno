@@ -631,7 +631,7 @@ fn render_surface(
         None => return Ok(()),
     };
 
-    let dmabuf = surface.surface.next_buffer()?;
+    let (dmabuf, _) = surface.surface.next_buffer()?;
     renderer.bind(dmabuf)?;
     let rendering = |renderer: &mut _, frame: &mut Gles2Frame| -> Result<(), SwapBuffersError> {
         macro_rules! r_f {
@@ -716,7 +716,7 @@ fn initial_render(
     surface: &mut RenderSurface,
     renderer: &mut Gles2Renderer,
 ) -> Result<(), SwapBuffersError> {
-    let dmabuf = surface.next_buffer()?;
+    let (dmabuf, _) = surface.next_buffer()?;
     renderer.bind(dmabuf)?;
 
     let rendering = |_: &mut _, frame: &mut Gles2Frame| frame.clear([0.8, 0.8, 0.9, 1.0]);
