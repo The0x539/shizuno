@@ -9,7 +9,7 @@ use smithay::backend::{
     SwapBuffersError,
 };
 use smithay::reexports::*;
-use smithay::utils::{Logical, Point, Rectangle};
+use smithay::utils::{Logical, Physical, Point, Rectangle};
 use smithay::wayland::{
     compositor::{
         get_role, with_states, with_surface_tree_upward, Damage, SubsurfaceCachedState,
@@ -20,6 +20,7 @@ use smithay::wayland::{
 };
 
 use image::{ImageBuffer, Rgba};
+use once_cell::sync::Lazy;
 use slog::{error, warn, Logger};
 use wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 
@@ -87,6 +88,12 @@ pub fn draw_cursor<'r, 'e>(
         (0, 0).into()
     });
     draw_surface_tree(r_f, surface, location - delta, output_scale, log)
+}
+
+pub fn full() -> &'static [Rectangle<i32, Physical>] {
+    static ALL: Lazy<[Rectangle<i32, Physical>; 1]> =
+        Lazy::new(|| [Rectangle::from_loc_and_size((0, 0), (i32::MAX, i32::MAX))]);
+    &ALL[..]
 }
 
 macro_rules! try_or_skip {
@@ -183,6 +190,7 @@ fn draw_surface_tree<'r, 'e, Tex: 'static>(
                 buffer_scale,
                 output_scale as f64,
                 Transform::Normal, // TODO
+                full(),
                 1.0,
             ) {
                 result = Err(e.into());
@@ -365,7 +373,7 @@ pub fn draw_fps<'r, 'e, Tex: 'static>(
             (22.0 * scale, 35.0 * scale),
         );
         frame
-            .render_texture_from_to(texture, src, dst, Transform::Normal, 1.0)
+            .render_texture_from_to(texture, src, dst, full(), Transform::Normal, 1.0)
             .map_err(Into::into)?;
     }
 

@@ -669,6 +669,7 @@ fn render_surface(
                     1,
                     scale as f64,
                     Transform::Normal,
+                    full(),
                     1.0,
                 )?;
             }
@@ -719,7 +720,7 @@ fn initial_render(
     let (dmabuf, _) = surface.next_buffer()?;
     renderer.bind(dmabuf)?;
 
-    let rendering = |_: &mut _, frame: &mut Gles2Frame| frame.clear([0.8, 0.8, 0.9, 1.0], None);
+    let rendering = |_: &mut _, frame: &mut Gles2Frame| frame.clear([0.8, 0.8, 0.9, 1.0], full());
     renderer.render((1, 1).into(), Transform::Normal, rendering)??;
 
     surface.queue_buffer()?;
