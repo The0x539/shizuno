@@ -120,12 +120,8 @@ impl<B> State<B> {
             input::ButtonState::Pressed => wl_pointer::ButtonState::Pressed,
             input::ButtonState::Released => wl_pointer::ButtonState::Released,
         };
-        let button = match evt.button() {
-            input::MouseButton::Left => 0x110,
-            input::MouseButton::Right => 0x111,
-            input::MouseButton::Middle => 0x112,
-            input::MouseButton::Other(b) => b as u32,
-        };
+
+        let button = evt.button_code();
         self.pointer.button(button, state, serial, evt.time());
     }
 
