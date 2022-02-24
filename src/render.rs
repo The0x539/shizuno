@@ -29,7 +29,7 @@ pub fn render_layers_and_windows(
         };
     }
 
-    frame.clear([0.8, 0.8, 0.9, 1.0])?;
+    frame.clear([0.8, 0.8, 0.9, 1.0], None)?;
 
     draw_layers(r_f!(), window_map, Layer::Background, geometry, scale, log)?;
     draw_layers(r_f!(), window_map, Layer::Bottom, geometry, scale, log)?;
