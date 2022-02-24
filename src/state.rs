@@ -4,13 +4,14 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use smithay::desktop::{PopupManager, Space};
 use smithay::reexports::*;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::{
     data_device::{
         default_action_chooser, init_data_device, set_data_device_focus, DataDeviceEvent,
     },
-    output::xdg::init_xdg_output_manager,
+    output::{xdg::init_xdg_output_manager, Output},
     seat::{CursorImageStatus, KeyboardHandle, PointerHandle, Seat},
     shell::xdg::decoration::{init_xdg_decoration_manager, XdgDecorationRequest},
     shm,
@@ -24,10 +25,11 @@ use slog::{error, info, Logger};
 use wayland_protocols::unstable::xdg_decoration;
 use wayland_server::{protocol::wl_surface::WlSurface, DispatchData, Display};
 
-use crate::{output_map::OutputMap, shell::ShellHandles, util::PseudoCell, window_map::WindowMap};
+use crate::{shell::ShellHandles, util::PseudoCell};
 
 pub trait Backend {
     fn seat_name(&self) -> String;
+    fn reset_buffers(&mut self, output: &Output);
 }
 
 pub struct State<B> {
@@ -36,8 +38,9 @@ pub struct State<B> {
     pub running: Cell<bool>,
     pub display: Rc<RefCell<Display>>,
     pub handle: LoopHandle<'static, Self>,
-    pub window_map: Rc<RefCell<WindowMap>>,
-    pub output_map: Rc<RefCell<OutputMap>>,
+    pub space: Rc<RefCell<Space>>,
+    pub popups: Rc<RefCell<PopupManager>>,
+    pub shells: ShellHandles,
     pub drag_icon: Rc<RefCell<Option<WlSurface>>>,
     pub log: Logger,
 
@@ -80,16 +83,12 @@ impl<B: Backend + 'static> State<B> {
                 .expect("failed to init wayland event source");
         }
 
-        let window_map: Rc<RefCell<WindowMap>> = Default::default();
-        let output_map = Rc::new(RefCell::new(OutputMap::new(
-            display.clone(),
-            window_map.clone(),
-            log.clone(),
-        )));
+        let space = Rc::new(RefCell::new(Space::new(log.clone())));
+        let popups = Rc::new(RefCell::new(PopupManager::new(log.clone())));
 
         shm::init_shm_global(&mut display.borrow_mut(), vec![], log.clone());
 
-        ShellHandles::init::<B>(display.clone(), log.clone());
+        let shells = ShellHandles::init::<B>(display.clone(), log.clone());
 
         let display_rc = display;
         let mut display_ref = display_rc.borrow_mut();
@@ -172,8 +171,9 @@ impl<B: Backend + 'static> State<B> {
             running: true.into(),
             display,
             handle,
-            window_map,
-            output_map,
+            space,
+            popups,
+            shells,
             drag_icon,
             log,
 
@@ -204,10 +204,11 @@ fn xdg_activation_global_impl<B: 'static>(
             surface,
         } => {
             if token_data.timestamp.elapsed().as_secs() < 10 {
-                wm_state
-                    .window_map
-                    .borrow_mut()
-                    .bring_surface_to_top(&surface);
+                let mut space = wm_state.space.borrow_mut();
+                if let Some(window) = space.window_for_surface(&surface) {
+                    let window = window.clone();
+                    space.raise_window(&window, true);
+                }
             } else {
                 state.lock().unwrap().remove_request(&token);
             }

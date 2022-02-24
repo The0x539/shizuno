@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, os::unix::net::UnixStream, rc::Rc, sync::Arc};
 
+use smithay::desktop::{Kind as SurfaceKind, Space, Window, X11Surface};
 use smithay::reexports::*;
 use smithay::utils::{x11rb::X11Source, Logical, Point};
 use smithay::wayland::compositor::give_role;
@@ -13,17 +14,14 @@ use x11rb::{
         composite::{ConnectionExt as _, Redirect},
         xproto::{
             ChangeWindowAttributesAux, ConfigWindow, ConfigureWindowAux, ConnectionExt as _,
-            EventMask, Window, WindowClass,
+            EventMask, Window as X11Window, WindowClass,
         },
         Event,
     },
     rust_connection::{DefaultStream, RustConnection},
 };
 
-use crate::{
-    state::State,
-    window_map::{SurfaceTrait, WindowMap},
-};
+use crate::state::State;
 
 impl<B: 'static> State<B> {
     pub fn start_xwayland(&mut self) {
@@ -34,7 +32,7 @@ impl<B: 'static> State<B> {
 
     pub fn xwayland_ready(&mut self, connection: UnixStream, client: Client) {
         let (wm, source) =
-            X11State::start_wm(connection, self.window_map.clone(), self.log.clone()).unwrap();
+            X11State::start_wm(connection, self.space.clone(), self.log.clone()).unwrap();
         let wm = Rc::new(RefCell::new(wm));
         client.data_map().insert_if_missing(|| wm.clone());
         let log = self.log.clone();
@@ -63,14 +61,14 @@ struct X11State {
     conn: Arc<RustConnection>,
     atoms: Atoms,
     log: Logger,
-    unpaired_surfaces: HashMap<u32, (Window, Point<i32, Logical>)>,
-    window_map: Rc<RefCell<WindowMap>>,
+    unpaired_surfaces: HashMap<u32, (X11Window, Point<i32, Logical>)>,
+    space: Rc<RefCell<Space>>,
 }
 
 impl X11State {
     fn start_wm(
         connection: UnixStream,
-        window_map: Rc<RefCell<WindowMap>>,
+        space: Rc<RefCell<Space>>,
         log: Logger,
     ) -> Result<(Self, X11Source), Box<dyn std::error::Error>> {
         let screen = 0;
@@ -109,7 +107,7 @@ impl X11State {
             atoms,
             log: log.clone(),
             unpaired_surfaces: Default::default(),
-            window_map,
+            space,
         };
 
         Ok((
@@ -178,7 +176,7 @@ impl X11State {
         Ok(())
     }
 
-    fn new_window(&mut self, window: Window, surface: WlSurface, location: Point<i32, Logical>) {
+    fn new_window(&mut self, window: X11Window, surface: WlSurface, location: Point<i32, Logical>) {
         debug!(self.log, "Matched X11 surface {window:x?} to {surface:x?}");
 
         if give_role(&surface, "x11_surface").is_err() {
@@ -186,9 +184,10 @@ impl X11State {
             return;
         }
 
-        self.window_map
+        let surface = X11Surface { surface };
+        self.space
             .borrow_mut()
-            .insert(X11Surface { surface }.into(), location);
+            .map_window(&Window::new(SurfaceKind::X11(surface)), location, true);
     }
 }
 
@@ -199,28 +198,4 @@ pub fn commit_hook(surface: &WlSurface) {
     let id = surface.as_ref().id();
     let (window, location) = try_or!(return, inner.unpaired_surfaces.remove(&id));
     inner.new_window(window, surface.clone(), location);
-}
-
-#[derive(Clone)]
-pub struct X11Surface {
-    surface: WlSurface,
-}
-
-impl std::cmp::PartialEq for X11Surface {
-    fn eq(&self, other: &Self) -> bool {
-        self.alive() && other.alive() && self.surface == other.surface
-    }
-}
-
-impl SurfaceTrait for X11Surface {
-    fn alive(&self) -> bool {
-        self.surface.as_ref().is_alive()
-    }
-    fn get_surface(&self) -> Option<&WlSurface> {
-        if self.alive() {
-            Some(&self.surface)
-        } else {
-            None
-        }
-    }
 }

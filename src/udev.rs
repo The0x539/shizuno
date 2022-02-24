@@ -17,14 +17,17 @@ use smithay::backend::{
     udev::{primary_gpu, UdevBackend, UdevEvent},
     SwapBuffersError,
 };
+use smithay::desktop::space::{DynamicRenderElements, RenderError};
+use smithay::desktop::Space;
 use smithay::reexports::*;
+use smithay::utils::Rectangle;
 use smithay::utils::{
     signaling::{Linkable, SignalToken, Signaler},
     Logical, Point, Transform,
 };
 use smithay::wayland::{
     dmabuf::init_dmabuf_global,
-    output::{Mode, PhysicalProperties},
+    output::{Mode, Output, PhysicalProperties},
     seat::CursorImageStatus,
 };
 
@@ -44,19 +47,21 @@ use nix::{fcntl::OFlag, libc::dev_t};
 use slog::{crit, debug, error, info, trace, warn, Logger};
 use sugars::dur;
 use wayland_server::{
-    protocol::{wl_output::Subpixel, wl_surface::WlSurface},
-    DispatchData, Display,
+    protocol::{
+        wl_output::{Subpixel, WlOutput},
+        wl_surface::WlSurface,
+    },
+    DispatchData, Display, Global,
 };
 use xcursor::parser::Image;
 
-use crate::render::render_layers_and_windows;
+use crate::render::render_output;
+use crate::shell::fixup_positions;
 use crate::util::PseudoCell;
 use crate::{
     cursor::Cursor,
     drawing::*,
-    output_map::OutputMap,
     state::{Backend, State},
-    window_map::WindowMap,
 };
 
 #[derive(Clone)]
@@ -86,14 +91,31 @@ impl Backend for UdevData {
     fn seat_name(&self) -> String {
         self.session.seat()
     }
+
+    fn reset_buffers(&mut self, output: &Output) {
+        let id = try_or!(return, output.user_data().get::<UdevOutputId>());
+        let gpu = try_or!(return, self.backends.get(&id.device_id));
+        let surfaces = gpu.surfaces.borrow();
+        let surface = try_or!(return, surfaces.get(&id.crtc));
+        surface.borrow_mut().surface.reset_buffers();
+    }
 }
 
 pub type RenderSurface = GbmBufferedSurface<GbmDevice<SessionFd>, SessionFd>;
 
 struct SurfaceData {
     surface: RenderSurface,
+    global: Option<Global<WlOutput>>,
     #[cfg(feature = "debug")]
     fps: fps_ticker::Fps,
+}
+
+impl Drop for SurfaceData {
+    fn drop(&mut self) {
+        if let Some(global) = self.global.take() {
+            global.destroy();
+        }
+    }
 }
 
 struct BackendData {
@@ -210,13 +232,11 @@ pub fn run(log: Logger) {
         if dispatch_result.is_err() {
             state.running.set(false);
         } else {
+            state.space.borrow_mut().refresh();
+            state.popups.borrow_mut().cleanup();
             display.borrow_mut().flush_clients(&mut state);
-            state.window_map.borrow_mut().refresh();
-            state.output_map.borrow_mut().refresh();
         }
     }
-
-    state.window_map.borrow_mut().clear();
 
     handle.remove(session_event_source);
     handle.remove(libinput_event_source);
@@ -227,7 +247,8 @@ fn scan_connectors(
     device: &mut DrmDevice<SessionFd>,
     gbm: &GbmDevice<SessionFd>,
     renderer: &mut Gles2Renderer,
-    output_map: &mut OutputMap,
+    display: &mut Display,
+    space: &mut Space,
     signaler: &Signaler<SessionSignal>,
     log: &Logger,
 ) -> HashMap<crtc::Handle, Rc<RefCell<SurfaceData>>> {
@@ -319,15 +340,25 @@ fn scan_connectors(
                     make: "Smithay".into(),
                     model: "Generic DRM".into(),
                 };
-                let output = output_map.add(&output_name, props, mode);
+                let (output, global) = Output::new(display, output_name, props, None);
+                // TODO: arrangements and what not
+                let width = space
+                    .outputs()
+                    .map(|o| space.output_geometry(o).unwrap().size.w)
+                    .sum::<i32>();
+                let position = (width, 0).into();
+                output.change_current_state(Some(mode), None, None, Some(position));
+                output.set_preferred(mode);
+                space.map_output(&output, 1.0, position);
 
-                output.userdata().insert_if_missing(|| UdevOutputId {
+                output.user_data().insert_if_missing(|| UdevOutputId {
                     crtc,
                     device_id: device.device_id(),
                 });
 
                 let surface_data = SurfaceData {
                     surface,
+                    global: Some(global),
                     #[cfg(feature = "debug")]
                     fps: fps_ticker::Fps::default(),
                 };
@@ -391,7 +422,8 @@ impl State<UdevData> {
             &mut device,
             &gbm,
             &mut renderer.borrow_mut(),
-            &mut self.output_map.borrow_mut(),
+            &mut self.display.borrow_mut(),
+            &mut self.space.borrow_mut(),
             &self.backend_data.signaler,
             &self.log,
         )));
@@ -462,22 +494,20 @@ impl State<UdevData> {
             None => return,
         };
 
-        self.output_map.borrow_mut().retain(|output| {
-            output
-                .userdata()
-                .get::<UdevOutputId>()
-                .map(|id| id.device_id)
-                != Some(device_id)
-        });
+        let mut space = self.space.borrow_mut();
+        unmap_outputs(&mut space, device_id);
 
         backend_data.surfaces.set(scan_connectors(
             &mut backend_data.event_dispatcher.as_source_mut(),
             &backend_data.gbm,
             &mut backend_data.renderer.borrow_mut(),
-            &mut self.output_map.borrow_mut(),
+            &mut self.display.borrow_mut(),
+            &mut self.space.borrow_mut(),
             &self.backend_data.signaler,
             &self.log,
         ));
+
+        fixup_positions(&mut space);
 
         for renderer in backend_data.surfaces.borrow().values() {
             schedule_initial_render(
@@ -498,13 +528,10 @@ impl State<UdevData> {
         backend_data.surfaces.borrow_mut().clear();
         debug!(self.log, "Surfaces dropped");
 
-        self.output_map.borrow_mut().retain(|output| {
-            output
-                .userdata()
-                .get::<UdevOutputId>()
-                .map(|id| id.device_id)
-                != Some(device_id)
-        });
+        let mut space = self.space.borrow_mut();
+        unmap_outputs(&mut space, device_id);
+
+        fixup_positions(&mut space);
 
         self.handle.remove(backend_data.registration_token);
         let device = backend_data.event_dispatcher.into_source_inner();
@@ -565,8 +592,7 @@ impl State<UdevData> {
                 renderer,
                 backend.dev_id,
                 crtc,
-                &mut self.window_map.borrow_mut(),
-                &self.output_map.borrow(),
+                &mut self.space.borrow_mut(),
                 self.pointer_location,
                 pointer_image,
                 #[cfg(feature = "debug")]
@@ -576,33 +602,33 @@ impl State<UdevData> {
                 &self.log,
             );
 
-            if let Err(e) = result {
-                warn!(self.log, "Error during rendering: {e:?}");
-                let reschedule = match e {
-                    SwapBuffersError::AlreadySwapped => false,
-                    SwapBuffersError::TemporaryFailure(e) => match e.downcast_ref() {
-                        Some(DrmError::DeviceInactive) => false,
-                        Some(DrmError::Access { source, .. }) => {
-                            !matches!(source, drm::SystemError::PermissionDenied)
-                        }
-                        _ => true,
-                    },
-                    SwapBuffersError::ContextLost(e) => panic!("Rendering loop lost: {e}"),
-                };
-
-                if reschedule {
-                    debug!(self.log, "Rescheduling");
-                    self.backend_data
-                        .render_timer
-                        .add_timeout(dur!(1 sec) / 60, (backend.dev_id, crtc));
+            let reschedule = match result {
+                Ok(has_rendered) => !has_rendered,
+                Err(e) => {
+                    warn!(self.log, "Error during rendering: {e:?}");
+                    match e {
+                        SwapBuffersError::AlreadySwapped => false,
+                        SwapBuffersError::TemporaryFailure(e) => match e.downcast_ref() {
+                            Some(DrmError::DeviceInactive) => false,
+                            Some(DrmError::Access { source, .. }) => {
+                                !matches!(source, drm::SystemError::PermissionDenied)
+                            }
+                            _ => true,
+                        },
+                        SwapBuffersError::ContextLost(e) => panic!("Rendering loop lost: {e}"),
+                    }
                 }
-            } else {
-                // TODO: only send drawn windows the frames callback
-                // Send frame events so that client start drawing their next frame
-                self.window_map
-                    .borrow()
-                    .send_frames(self.start_time.elapsed());
+            };
+
+            if reschedule {
+                self.backend_data
+                    .render_timer
+                    .add_timeout(dur!(1 sec) / 60, (backend.dev_id, crtc));
             }
+
+            self.space
+                .borrow()
+                .send_frames(false, self.start_time.elapsed().as_millis() as u32);
         }
     }
 }
@@ -613,81 +639,81 @@ fn render_surface(
     renderer: &mut Gles2Renderer,
     device_id: dev_t,
     crtc: crtc::Handle,
-    window_map: &mut WindowMap,
-    output_map: &OutputMap,
+    space: &mut Space,
     pointer_location: Point<f64, Logical>,
     pointer_image: &Gles2Texture,
     #[cfg(feature = "debug")] fps_texture: &Gles2Texture,
     drag_icon: &Option<WlSurface>,
     cursor_status: &mut CursorImageStatus,
     log: &Logger,
-) -> Result<(), SwapBuffersError> {
+) -> Result<bool, SwapBuffersError> {
     surface.surface.frame_submitted()?;
 
-    let output_id = UdevOutputId { device_id, crtc };
-    let output = output_map.find(|o| o.userdata().get::<UdevOutputId>() == Some(&output_id));
-    let (geometry, scale, mode) = match output {
-        Some(o) => (o.geometry(), o.scale(), o.current_mode()),
-        None => return Ok(()),
+    let output = match space
+        .outputs()
+        .find(|o| o.user_data().get::<UdevOutputId>() == Some(&UdevOutputId { device_id, crtc }))
+    {
+        Some(o) => o.clone(),
+        None => return Ok(true), // somehow called with an invalid output
     };
 
-    let (dmabuf, _) = surface.surface.next_buffer()?;
+    let geometry = space.output_geometry(&output).unwrap();
+    let (dmabuf, age) = surface.surface.next_buffer()?;
     renderer.bind(dmabuf)?;
-    let rendering = |renderer: &mut _, frame: &mut Gles2Frame| -> Result<(), SwapBuffersError> {
-        macro_rules! r_f {
-            () => {
-                (&mut *renderer, &mut *frame)
-            };
-        }
 
-        render_layers_and_windows(renderer, frame, window_map, geometry, scale, log)?;
+    let mut elements = Vec::<DynamicRenderElements<_>>::new();
 
-        if geometry.to_f64().contains(pointer_location) {
-            let relative_ptr_location = pointer_location.to_i32_round() - geometry.loc;
-
-            if let Some(surface) = drag_icon {
-                if surface.as_ref().is_alive() {
-                    draw_drag_icon(r_f!(), surface, relative_ptr_location, scale, log)?;
-                }
-            }
-
-            if let CursorImageStatus::Image(surface) = cursor_status {
-                if !surface.as_ref().is_alive() {
-                    *cursor_status = CursorImageStatus::Default;
-                }
-            }
-
-            if let CursorImageStatus::Image(surface) = cursor_status {
-                draw_cursor(r_f!(), surface, relative_ptr_location, scale, log)?;
-            } else {
-                frame.render_texture_at(
-                    pointer_image,
-                    relative_ptr_location
-                        .to_f64()
-                        .to_physical(scale as f64)
-                        .to_i32_round(),
-                    1,
-                    scale as f64,
-                    Transform::Normal,
-                    &full(),
-                    1.0,
-                )?;
-            }
-
-            // Not sure why this got moved to inside the conditional.
-            #[cfg(feature = "debug")]
-            {
-                let fps = &mut surface.fps;
-                draw_fps(r_f!(), fps_texture, scale as f64, fps.avg().round() as u32)?;
-                fps.tick();
+    // set cursor
+    if geometry.to_f64().contains(pointer_location) {
+        let relative_ptr_location = pointer_location.to_i32_round() - geometry.loc;
+        if let Some(wl_surface) = drag_icon {
+            if wl_surface.as_ref().is_alive() {
+                elements.push(Box::new(draw_drag_icon_new(
+                    wl_surface.clone(),
+                    relative_ptr_location,
+                    log,
+                )));
             }
         }
-        Ok(())
-    };
 
-    renderer.render(mode.size, Transform::Normal, rendering)??;
-    surface.surface.queue_buffer()?;
-    Ok(())
+        if let CursorImageStatus::Image(surface) = cursor_status {
+            if !surface.as_ref().is_alive() {
+                *cursor_status = CursorImageStatus::Default;
+            }
+        }
+
+        if let CursorImageStatus::Image(surface) = cursor_status {
+            elements.push(Box::new(draw_cursor_new(
+                surface.clone(),
+                relative_ptr_location,
+                log,
+            )));
+        } else {
+            elements.push(Box::new(PointerElement::new(
+                pointer_image.clone(),
+                relative_ptr_location,
+            )));
+        }
+    }
+
+    // Not sure why this got moved to inside the conditional.
+    #[cfg(feature = "debug")]
+    {
+        let fps_val = surface.fps.avg().round() as u32;
+        elements.push(Box::new(draw_fps_new(fps_texture, fps_val)));
+        surface.fps.tick();
+    }
+
+    // TODO: pass damage rectangles inside an AtomicCommitRequest
+    match render_output(&output, space, renderer, age.into(), &elements, log) {
+        Ok(Some(_)) => {
+            surface.surface.queue_buffer()?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(RenderError::Rendering(e)) => Err(e.into()),
+        Err(_) => unreachable!(),
+    }
 }
 
 fn schedule_initial_render(
@@ -720,9 +746,27 @@ fn initial_render(
     let (dmabuf, _) = surface.next_buffer()?;
     renderer.bind(dmabuf)?;
 
-    let rendering = |_: &mut _, frame: &mut Gles2Frame| frame.clear([0.8, 0.8, 0.9, 1.0], &full());
+    let damage = &[Rectangle::from_loc_and_size((0, 0), (1, 1))];
+    let rendering = |_: &mut _, frame: &mut Gles2Frame| frame.clear(CLEAR_COLOR, damage);
     renderer.render((1, 1).into(), Transform::Normal, rendering)??;
 
     surface.queue_buffer()?;
+    surface.reset_buffers();
     Ok(())
+}
+
+fn unmap_outputs(space: &mut Space, device_id: dev_t) {
+    let to_unmap = space
+        .outputs()
+        .filter(|o| {
+            o.user_data()
+                .get::<UdevOutputId>()
+                .map_or(false, |id| id.device_id == device_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for output in to_unmap {
+        space.unmap_output(&output);
+    }
 }

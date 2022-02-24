@@ -69,19 +69,6 @@ impl<T> PseudoCell for std::sync::Mutex<T> {
     }
 }
 
-pub fn with_surface_tree_downward_all(
-    wl_surface: &WlSurface,
-    mut f: impl FnMut(&WlSurface, &SurfaceData),
-) {
-    smithay::wayland::compositor::with_surface_tree_downward(
-        wl_surface,
-        (),
-        |_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
-        |wl_surface, states, &()| f(wl_surface, states),
-        |_, _, &()| true,
-    );
-}
-
 pub fn with_surface_tree_upward_all(
     wl_surface: &WlSurface,
     mut f: impl FnMut(&WlSurface, &SurfaceData),

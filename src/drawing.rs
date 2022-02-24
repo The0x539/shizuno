@@ -1,328 +1,271 @@
-use std::{cell::RefCell, ops::Deref, sync::Mutex};
+use std::{ops::Deref, sync::Mutex};
 
-use smithay::backend::{
-    renderer::{
-        buffer_type,
-        gles2::{Gles2Error, Gles2Renderer, Gles2Texture},
-        BufferType, Frame, ImportAll, Renderer, Texture,
-    },
-    SwapBuffersError,
+use smithay::backend::renderer::{
+    gles2::{Gles2Error, Gles2Renderer, Gles2Texture},
+    Frame, ImportAll, Renderer, Texture,
 };
+use smithay::desktop::space::{RenderElement, SpaceOutputTuple, SurfaceTree};
 use smithay::reexports::*;
-use smithay::utils::{Logical, Point, Rectangle, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 use smithay::wayland::{
-    compositor::{
-        get_role, with_states, with_surface_tree_upward, Damage, SubsurfaceCachedState,
-        SurfaceAttributes, TraversalAction,
-    },
+    compositor::{get_role, with_states},
     seat::CursorImageAttributes,
-    shell::wlr_layer::Layer,
 };
 
 use image::{ImageBuffer, Rgba};
-use slog::{error, warn, Logger};
-use wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
+use slog::{warn, Logger};
+use wayland_server::protocol::wl_surface::WlSurface;
 
-use crate::{
-    shell::SurfaceData,
-    window_map::{LayerSurface, SurfaceTrait, WindowMap},
-};
+pub(crate) static CLEAR_COLOR: [f32; 4] = [0.8, 0.8, 0.9, 1.0];
 
-// TODO: a more general "draw context bundle" kinda struct.
-// these functions' signatures are very similar.
-pub trait RendererAndFrame<'r, 'f> {
-    type R: Renderer<Error = Self::E, TextureId = Self::T, Frame = Self::F> + ImportAll + 'r;
-    type F: Frame<Error = Self::E, TextureId = Self::T> + 'f;
-    type E: std::error::Error + Into<SwapBuffersError>;
-    type T: Texture + 'static;
-    fn pair(self) -> (&'r mut Self::R, &'f mut Self::F);
-}
-
-impl<'r, 'f, R, E, F, T> RendererAndFrame<'r, 'f> for (&'r mut R, &'f mut F)
-where
-    R: Renderer<Error = E, TextureId = T, Frame = F> + ImportAll + 'r,
-    F: Frame<Error = E, TextureId = T> + 'f,
-    E: std::error::Error + Into<SwapBuffersError>,
-    T: Texture + 'static,
-{
-    type R = R;
-    type F = F;
-    type E = E;
-    type T = T;
-    fn pair(self) -> (&'r mut R, &'f mut F) {
-        self
-    }
-}
-
-struct BufferTextures<T> {
-    buffer: Option<WlBuffer>,
-    texture: T,
-}
-
-impl<T> Drop for BufferTextures<T> {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            buffer.release();
-        }
-    }
-}
-
-pub fn draw_cursor<'r, 'e>(
-    r_f: impl RendererAndFrame<'r, 'e>,
-    surface: &WlSurface,
-    location: Point<i32, Logical>,
-    output_scale: f32,
+pub(crate) fn draw_cursor_new<R, F, E, T>(
+    surface: WlSurface,
+    location: impl Into<Point<i32, Logical>>,
     log: &Logger,
-) -> Result<(), SwapBuffersError> {
-    let delta = with_states(surface, |states| {
-        type Mcia = Mutex<CursorImageAttributes>;
-        let data = states.data_map.get::<Mcia>().unwrap().lock().unwrap();
-        data.hotspot
-    })
-    .unwrap_or_else(|_| {
+) -> impl RenderElement<R, F, E, T>
+where
+    R: Renderer<Error = E, TextureId = T, Frame = F> + ImportAll,
+    F: Frame<Error = E, TextureId = T>,
+    T: Texture + 'static,
+    E: std::error::Error,
+{
+    let mut position = location.into();
+
+    if let Ok(hotspot) = with_states(&surface, |states| {
+        states
+            .data_map
+            .get::<Mutex<CursorImageAttributes>>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .hotspot
+    }) {
+        position -= hotspot;
+    } else {
         warn!(
             log,
             "Trying to display as a cursor a surface that does not have the CursorImage role.",
         );
-        (0, 0).into()
-    });
-    draw_surface_tree(r_f, surface, location - delta, output_scale, log)
+    }
+
+    SurfaceTree { surface, position }
 }
 
-pub fn full<T>() -> [Rectangle<i32, T>; 1] {
-    [Rectangle::from_loc_and_size((0, 0), (i32::MAX, i32::MAX))]
-}
-
-macro_rules! try_or_skip {
-    ($e:expr) => {
-        try_or!(return TraversalAction::SkipChildren, $e)
-    };
-}
-
-fn draw_surface_tree<'r, 'e, Tex: 'static>(
-    r_f: impl RendererAndFrame<'r, 'e, T = Tex>,
-    root: &WlSurface,
-    location: Point<i32, Logical>,
-    output_scale: f32,
+pub(crate) fn draw_drag_icon_new<R, F, E, T>(
+    surface: WlSurface,
+    location: impl Into<Point<i32, Logical>>,
     log: &Logger,
-) -> Result<(), SwapBuffersError> {
-    let (renderer, frame) = r_f.pair();
-    let mut result = Ok(());
-
-    with_surface_tree_upward(
-        root,
-        location,
-        |_surface, states, location| {
-            let mut location = *location;
-
-            let data = try_or_skip!(states.data_map.get::<RefCell<SurfaceData>>());
-
-            let mut data = data.borrow_mut();
-            let attributes = states.cached_state.current::<SurfaceAttributes>();
-            if data.texture.is_none() {
-                let buffer = try_or_skip!(data.buffer.take());
-
-                let damage = attributes
-                    .damage
-                    .iter()
-                    .map(|dmg| match dmg {
-                        Damage::Buffer(rect) => *rect,
-                        // TODO: also apply transformations
-                        Damage::Surface(rect) => rect.to_buffer(
-                            attributes.buffer_scale,
-                            attributes.buffer_transform.into(),
-                            &data.size().unwrap(),
-                        ),
-                    })
-                    .collect::<Vec<_>>();
-
-                match renderer.import_buffer(&buffer, Some(states), &damage) {
-                    Some(Ok(texture)) => {
-                        let buffer = match buffer_type(&buffer) {
-                            Some(BufferType::Shm) => {
-                                buffer.release();
-                                None
-                            }
-                            _ => Some(buffer),
-                        };
-                        data.texture = Some(Box::new(BufferTextures { buffer, texture }))
-                    }
-                    Some(Err(err)) => {
-                        warn!(log, "Error loading buffer: {err:?}");
-                        buffer.release();
-                    }
-                    None => {
-                        error!(log, "Unknown buffer format for: {buffer:?}");
-                        buffer.release();
-                    }
-                }
-            }
-
-            if data.texture.is_some() {
-                if states.role == Some("subsurface") {
-                    let current = states.cached_state.current::<SubsurfaceCachedState>();
-                    location += current.location;
-                }
-                TraversalAction::DoChildren(location)
-            } else {
-                TraversalAction::SkipChildren
-            }
-        },
-        |_surface, states, location| {
-            let mut location = *location;
-            let data = try_or!(return, states.data_map.get::<RefCell<SurfaceData>>());
-            let mut data = data.borrow_mut();
-            let buffer_scale = data.buffer_scale;
-            let buffer_transform = data.buffer_transform;
-
-            let texture = try_or!(return, data.texture.as_mut());
-            let texture = try_or!(return, texture.downcast_mut::<BufferTextures<Tex>>());
-
-            if states.role == Some("subsurface") {
-                let current = states.cached_state.current::<SubsurfaceCachedState>();
-                location += current.location;
-            }
-
-            if let Err(e) = frame.render_texture_at(
-                &texture.texture,
-                location
-                    .to_f64()
-                    .to_physical(output_scale as f64)
-                    .to_i32_round(),
-                buffer_scale,
-                output_scale as f64,
-                buffer_transform,
-                &full(),
-                1.0,
-            ) {
-                result = Err(e.into());
-            }
-        },
-        |_, _, _| true,
-    );
-
-    result
-}
-
-pub fn draw_layers<'r, 'e>(
-    r_f: impl RendererAndFrame<'r, 'e>,
-    window_map: &WindowMap,
-    layer: Layer,
-    output_rect: Rectangle<i32, Logical>,
-    output_scale: f32,
-    log: &Logger,
-) -> Result<(), SwapBuffersError> {
-    let (renderer, frame) = r_f.pair();
-
-    let mut result = Ok(());
-    let f = |layer_surface: &LayerSurface| {
-        // skip layers that do not overlap with a given output
-        if !output_rect.overlaps(layer_surface.bbox) {
-            return;
-        }
-
-        let mut initial_place: Point<i32, Logical> = layer_surface.location;
-        initial_place.x -= output_rect.loc.x;
-
-        let wl_surface = try_or!(return, layer_surface.surface.get_surface());
-
-        if let Err(e) = draw_surface_tree(
-            (&mut *renderer, &mut *frame),
-            wl_surface,
-            initial_place,
-            output_scale,
-            log,
-        ) {
-            result = Err(e);
-        }
-
-        window_map.with_child_popups(wl_surface, |popup| {
-            let location = popup.location();
-            let draw_location = initial_place + location;
-            let wl_surface = try_or!(return, popup.get_surface());
-            if let Err(e) = draw_surface_tree(
-                (&mut *renderer, &mut *frame),
-                wl_surface,
-                draw_location,
-                output_scale,
-                log,
-            ) {
-                result = Err(e);
-            }
-        });
-    };
-
-    window_map.layers.with_layers_from_bottom_to_top(&layer, f);
-
-    result
-}
-
-pub fn draw_drag_icon<'r, 'e>(
-    r_f: impl RendererAndFrame<'r, 'e>,
-    surface: &WlSurface,
-    location: Point<i32, Logical>,
-    output_scale: f32,
-    log: &Logger,
-) -> Result<(), SwapBuffersError> {
-    if get_role(surface) != Some("dnd_icon") {
+) -> impl RenderElement<R, F, E, T>
+where
+    R: Renderer<Error = E, TextureId = T, Frame = F> + ImportAll,
+    F: Frame<Error = E, TextureId = T>,
+    T: Texture + 'static,
+    E: std::error::Error,
+{
+    if get_role(&surface) != Some("dnd_icon") {
         warn!(
             log,
             "Trying to display an inappropriate surface as a drag icon.",
         );
     }
-    draw_surface_tree(r_f, surface, location, output_scale, log)
+    let position = location.into();
+    SurfaceTree { surface, position }
+}
+
+pub(crate) struct PointerElement<T> {
+    texture: T,
+    position: Point<i32, Logical>,
+    size: Size<i32, Logical>,
+}
+
+impl<T: Texture> PointerElement<T> {
+    pub(crate) fn new(texture: T, position: Point<i32, Logical>) -> Self {
+        let size = texture.size().to_logical(1, Transform::Normal);
+        Self {
+            texture,
+            position,
+            size,
+        }
+    }
+}
+
+impl<R, F, E, T> RenderElement<R, F, E, T> for PointerElement<T>
+where
+    R: Renderer<Error = E, TextureId = T, Frame = F> + ImportAll,
+    F: Frame<Error = E, TextureId = T>,
+    T: Texture + 'static,
+    E: std::error::Error,
+{
+    fn id(&self) -> usize {
+        0
+    }
+
+    fn geometry(&self) -> Rectangle<i32, Logical> {
+        Rectangle::from_loc_and_size(self.position, self.size)
+    }
+
+    fn accumulated_damage(
+        &self,
+        _: Option<SpaceOutputTuple<'_, '_>>,
+    ) -> Vec<Rectangle<i32, Logical>> {
+        vec![Rectangle::from_loc_and_size(self.position, self.size)]
+    }
+
+    fn draw(
+        &self,
+        _renderer: &mut R,
+        frame: &mut F,
+        scale: f64,
+        location: Point<i32, Logical>,
+        damage: &[Rectangle<i32, Logical>],
+        _log: &Logger,
+    ) -> Result<(), E> {
+        let pos = location.to_f64().to_physical(scale).to_i32_round();
+
+        let damage = damage
+            .iter()
+            .map(|rect| rect.to_buffer(1, Transform::Normal, &self.size))
+            .collect::<Vec<_>>();
+
+        frame.render_texture_at(
+            &self.texture,
+            pos,
+            1,
+            scale,
+            Transform::Normal,
+            &damage,
+            1.0,
+        )
+    }
 }
 
 #[cfg(feature = "debug")]
-pub static FPS_NUMBERS_PNG: &[u8] = include_bytes!("../resources/numbers.png");
+pub(crate) static FPS_NUMBERS_PNG: &[u8] = include_bytes!("../resources/numbers.png");
 
-pub fn draw_windows<'r, 'e>(
-    r_f: impl RendererAndFrame<'r, 'e>,
-    window_map: &WindowMap,
-    output_rect: Rectangle<i32, Logical>,
-    output_scale: f32,
-    log: &Logger,
-) -> Result<(), SwapBuffersError> {
-    let (renderer, frame) = r_f.pair();
-    let mut result = Ok(());
+#[cfg(feature = "debug")]
+pub(crate) struct FpsElement<T> {
+    value: u32,
+    texture: T,
+}
 
-    window_map.with_windows_from_bottom_to_top(|root_surface, mut initial_place, &bounding_box| {
-        if !output_rect.overlaps(bounding_box) {
-            return;
+#[cfg(feature = "debug")]
+impl<R, F, E, T> RenderElement<R, F, E, T> for FpsElement<T>
+where
+    R: Renderer<Error = E, TextureId = T, Frame = F> + ImportAll,
+    F: Frame<Error = E, TextureId = T>,
+    T: Texture + 'static,
+    E: std::error::Error,
+{
+    fn id(&self) -> usize {
+        0
+    }
+
+    fn geometry(&self) -> Rectangle<i32, Logical> {
+        let digits = match self.value {
+            0..=9 => 1,
+            10..=99 => 2,
+            _ => 3,
+        };
+        Rectangle::from_loc_and_size((0, 0), (24 * digits, 35))
+    }
+
+    fn accumulated_damage(
+        &self,
+        _: Option<SpaceOutputTuple<'_, '_>>,
+    ) -> Vec<Rectangle<i32, Logical>> {
+        vec![Rectangle::from_loc_and_size((0, 0), (24 * 3, 35))]
+    }
+
+    fn draw(
+        &self,
+        _renderer: &mut R,
+        frame: &mut F,
+        scale: f64,
+        location: Point<i32, Logical>,
+        damage: &[Rectangle<i32, Logical>],
+        _log: &Logger,
+    ) -> Result<(), E> {
+        let location = location.to_f64().to_physical(scale);
+
+        let area: Size<i32, Logical> = (22, 35).into();
+
+        for (i, digit) in get_digits(self.value).into_iter().enumerate() {
+            let offset_x = location.x + i as f64 * 24.0 * scale;
+
+            let r = Rectangle::from_loc_and_size(((offset_x / scale) as i32, 0), area);
+            let damage = damage
+                .iter()
+                .flat_map(|x| x.intersection(r))
+                .map(|mut x| {
+                    x.loc = (0, 0).into();
+                    x.to_buffer(1, Transform::Normal, &area)
+                })
+                .collect::<Vec<_>>();
+
+            let src_loc = match digit {
+                9 => (0, 0),
+                6 => (22, 0),
+                3 => (44, 0),
+                1 => (66, 0),
+
+                8 => (0, 35),
+                0 => (22, 35),
+                2 => (44, 35),
+
+                7 => (0, 70),
+                4 => (22, 70),
+                5 => (44, 70),
+
+                _ => unreachable!(),
+            };
+            let src_area = area.to_buffer(1, Transform::Normal);
+
+            let dst_loc = (offset_x, location.y);
+            let dst_area = area.to_f64().to_physical(scale);
+
+            frame.render_texture_from_to(
+                &self.texture,
+                Rectangle::from_loc_and_size(src_loc, src_area),
+                Rectangle::from_loc_and_size(dst_loc, dst_area),
+                &damage,
+                Transform::Normal,
+                1.0,
+            )?;
         }
+        Ok(())
+    }
+}
 
-        initial_place.x -= output_rect.loc.x;
-        let wl_surface = try_or!(return, root_surface.get_surface());
+#[cfg(feature = "debug")]
+pub(crate) fn draw_fps_new<R, F, E, T>(texture: &T, value: u32) -> impl RenderElement<R, F, E, T>
+where
+    R: Renderer<Error = E, TextureId = T, Frame = F> + ImportAll,
+    F: Frame<Error = E, TextureId = T>,
+    T: Texture + Clone + 'static,
+    E: std::error::Error,
+{
+    let texture = texture.clone();
+    FpsElement { value, texture }
+}
 
-        if let Err(e) = draw_surface_tree(
-            (&mut *renderer, &mut *frame),
-            wl_surface,
-            initial_place,
-            output_scale,
-            log,
-        ) {
-            result = Err(e);
-        }
+// TODO: a more general "draw context bundle" kinda struct.
+// these functions' signatures are very similar.
+pub(crate) trait RendererAndFrame<'r, 'f> {
+    type R: 'r;
+    type F: 'f;
+    fn pair(self) -> (&'r mut Self::R, &'f mut Self::F);
+}
 
-        let toplevel_geometry_offset = window_map.geometry(root_surface).unwrap_or_default().loc;
-
-        window_map.with_child_popups(wl_surface, |popup| {
-            let draw_location = initial_place + popup.location() + toplevel_geometry_offset;
-            let wl_surface = try_or!(return, popup.get_surface());
-
-            if let Err(e) = draw_surface_tree(
-                (&mut *renderer, &mut *frame),
-                wl_surface,
-                draw_location,
-                output_scale,
-                log,
-            ) {
-                result = Err(e);
-            }
-        });
-    });
-
-    result
+impl<'r, 'f, R, F> RendererAndFrame<'r, 'f> for (&'r mut R, &'f mut F)
+where
+    R: 'r,
+    F: 'f,
+{
+    type R = R;
+    type F = F;
+    fn pair(self) -> (&'r mut R, &'f mut F) {
+        self
+    }
 }
 
 fn get_digits(mut x: u32) -> Vec<u8> {
@@ -343,46 +286,7 @@ fn get_digits(mut x: u32) -> Vec<u8> {
     }
 }
 
-#[cfg(feature = "debug")]
-pub fn draw_fps<'r, 'e, Tex: 'static>(
-    r_f: impl RendererAndFrame<'r, 'e, T = Tex>,
-    texture: &Tex,
-    scale: f64,
-    value: u32,
-) -> Result<(), SwapBuffersError> {
-    let (_renderer, frame) = r_f.pair();
-
-    for (i, digit) in get_digits(value).into_iter().enumerate() {
-        let src_loc = match digit {
-            9 => (0, 0),
-            6 => (22, 0),
-            3 => (44, 0),
-            1 => (66, 0),
-
-            8 => (0, 35),
-            0 => (22, 35),
-            2 => (44, 35),
-
-            7 => (0, 70),
-            4 => (22, 70),
-            5 => (44, 70),
-
-            _ => unreachable!(),
-        };
-        let src = Rectangle::from_loc_and_size(src_loc, (22, 35));
-        let dst = Rectangle::from_loc_and_size(
-            (i as f64 * 24.0 * scale, 0.0),
-            (22.0 * scale, 35.0 * scale),
-        );
-        frame
-            .render_texture_from_to(texture, src, dst, &full(), Transform::Normal, 1.0)
-            .map_err(Into::into)?;
-    }
-
-    Ok(())
-}
-
-pub fn import_bitmap<C: Deref<Target = [u8]>>(
+pub(crate) fn import_bitmap<C: Deref<Target = [u8]>>(
     renderer: &mut Gles2Renderer,
     image: &ImageBuffer<Rgba<u8>, C>,
 ) -> Result<Gles2Texture, Gles2Error> {

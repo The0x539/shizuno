@@ -1,20 +1,22 @@
-use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use smithay::backend::renderer::buffer_dimensions;
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::desktop::{
+    layer_map_for_output, Kind as SurfaceKind, LayerSurface, PopupKeyboardGrab, PopupKind,
+    PopupManager, PopupPointerGrab, PopupUngrabStrategy, Space, Window,
+};
 use smithay::reexports::*;
-use smithay::utils::{Buffer, Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer, Logical, Point, Rectangle, Size};
 use smithay::wayland::{
-    compositor::{
-        compositor_init, is_sync_subsurface, with_states, BufferAssignment, SurfaceAttributes,
-    },
+    compositor::{compositor_init, with_states},
+    output::Output,
     seat::{AxisFrame, PointerGrab, PointerGrabStartData, PointerInnerHandle, Seat},
     shell::{
-        legacy::{wl_shell_init, ShellRequest, ShellState as WlShellState, ShellSurfaceKind},
-        wlr_layer::{wlr_layer_shell_init, LayerShellRequest, LayerSurfaceAttributes},
+        wlr_layer::{
+            wlr_layer_shell_init, LayerShellRequest, LayerShellState, LayerSurfaceAttributes,
+        },
         xdg::{
             xdg_shell_init, Configure, ShellState as XdgShellState, SurfaceCachedState,
             XdgPopupSurfaceRoleAttributes, XdgRequest, XdgToplevelSurfaceRoleAttributes,
@@ -24,28 +26,25 @@ use smithay::wayland::{
 };
 
 use bitflags::bitflags;
-use slog::Logger;
+use slog::{trace, warn, Logger};
 use wayland_protocols::xdg_shell::server::xdg_toplevel;
 use wayland_server::{
     protocol::{
-        wl_buffer::WlBuffer, wl_output::WlOutput, wl_pointer::ButtonState, wl_shell_surface,
-        wl_surface::WlSurface,
+        wl_output::WlOutput, wl_pointer::ButtonState, wl_shell_surface, wl_surface::WlSurface,
     },
     DispatchData, Display,
 };
 
-use crate::util::with_surface_tree_upward_all;
-use crate::window_map::PopupKind;
+use crate::state::Backend;
 use crate::{
-    output_map::OutputMap,
     state::State,
-    window_map::{Kind as SurfaceKind, SurfaceTrait, WindowMap},
+    util::{with_surface_tree_upward_all, PseudoCell},
 };
 
 struct MoveSurfaceGrab {
     start_data: PointerGrabStartData,
-    window_map: Rc<RefCell<WindowMap>>,
-    toplevel: SurfaceKind,
+    space: Rc<RefCell<Space>>,
+    window: Window,
     initial_window_location: Point<i32, Logical>,
 }
 
@@ -62,10 +61,10 @@ impl PointerGrab for MoveSurfaceGrab {
 
         let delta = location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-        self.window_map.borrow_mut().set_location(
-            &self.toplevel,
-            (new_location.x as i32, new_location.y as i32).into(),
-        );
+
+        self.space
+            .borrow_mut()
+            .map_window(&self.window, new_location.to_i32_round(), true);
     }
 
     fn button(
@@ -93,7 +92,7 @@ impl PointerGrab for MoveSurfaceGrab {
 
 struct ResizeSurfaceGrab {
     start_data: PointerGrabStartData,
-    toplevel: SurfaceKind,
+    window: Window,
     edges: ResizeEdge,
     initial_window_size: Size<i32, Logical>,
     last_window_size: Size<i32, Logical>,
@@ -108,8 +107,10 @@ impl PointerGrab for ResizeSurfaceGrab {
         serial: Serial,
         time: u32,
     ) {
+        let toplevel = self.window.toplevel();
+
         // It is impossible to get `min_size` and `max_size` of dead toplevel, so we return early.
-        if !self.toplevel.alive() | self.toplevel.get_surface().is_none() {
+        if !toplevel.alive() || toplevel.get_surface().is_none() {
             handle.unset_grab(serial, time);
             return;
         }
@@ -140,7 +141,7 @@ impl PointerGrab for ResizeSurfaceGrab {
             new_window_height = (self.initial_window_size.h as f64 + dy) as i32;
         }
 
-        let (min_size, max_size) = with_states(self.toplevel.get_surface().unwrap(), |states| {
+        let (min_size, max_size) = with_states(toplevel.get_surface().unwrap(), |states| {
             let data = states.cached_state.current::<SurfaceCachedState>();
             (data.min_size, data.max_size)
         })
@@ -164,7 +165,7 @@ impl PointerGrab for ResizeSurfaceGrab {
 
         self.last_window_size = (new_window_width, new_window_height).into();
 
-        match &self.toplevel {
+        match toplevel {
             SurfaceKind::Xdg(xdg) => {
                 let ret = xdg.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Resizing);
@@ -174,7 +175,6 @@ impl PointerGrab for ResizeSurfaceGrab {
                     xdg.send_configure();
                 }
             }
-            SurfaceKind::Wl(wl) => wl.send_configure(self.last_window_size, self.edges.into()),
             SurfaceKind::X11(_) => {
                 // TODO: What to do here? Send the update via X11?
             }
@@ -194,12 +194,14 @@ impl PointerGrab for ResizeSurfaceGrab {
             // No more buttons are pressed, release the grab.
             handle.unset_grab(serial, time);
 
+            let toplevel = self.window.toplevel();
+
             // If toplevel is dead, we can't resize it, so we return early.
-            if !self.toplevel.alive() | self.toplevel.get_surface().is_none() {
+            if !toplevel.alive() || toplevel.get_surface().is_none() {
                 return;
             }
 
-            if let SurfaceKind::Xdg(xdg) = &self.toplevel {
+            if let SurfaceKind::Xdg(xdg) = toplevel {
                 let ret = xdg.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Resizing);
                     state.size = Some(self.last_window_size);
@@ -208,7 +210,7 @@ impl PointerGrab for ResizeSurfaceGrab {
                     xdg.send_configure();
                 }
 
-                with_states(self.toplevel.get_surface().unwrap(), |states| {
+                with_states(toplevel.get_surface().unwrap(), |states| {
                     let mut data = states
                         .data_map
                         .get::<RefCell<SurfaceData>>()
@@ -222,7 +224,7 @@ impl PointerGrab for ResizeSurfaceGrab {
                 })
                 .unwrap();
             } else {
-                with_states(self.toplevel.get_surface().unwrap(), |states| {
+                with_states(toplevel.get_surface().unwrap(), |states| {
                     let mut data = states
                         .data_map
                         .get::<RefCell<SurfaceData>>()
@@ -309,130 +311,90 @@ impl From<ResizeEdge> for xdg_toplevel::ResizeEdge {
 
 pub struct ShellHandles {
     pub xdg_state: Arc<Mutex<XdgShellState>>,
-    pub wl_state: Arc<Mutex<WlShellState>>,
+    //pub wl_state: Arc<Mutex<WlShellState>>,
+    pub layer_state: Arc<Mutex<LayerShellState>>,
 }
 
 fn fullscreen_output_geometry(
     wl_surface: &WlSurface,
     wl_output: Option<&WlOutput>,
-    window_map: &WindowMap,
-    output_map: &OutputMap,
+    space: &mut Space,
 ) -> Option<Rectangle<i32, Logical>> {
-    if let Some(wl_output) = wl_output {
-        return output_map.find_by_output(wl_output).map(|o| o.geometry());
+    let output = if let Some(output) = wl_output.and_then(Output::from_resource) {
+        output
+    } else {
+        let window = space.window_for_surface(wl_surface)?;
+        space.outputs_for_window(window).first()?.clone()
+    };
+    space.output_geometry(&output)
+}
+
+#[derive(Default)]
+pub struct FullscreenSurface(RefCell<Option<Window>>);
+
+impl FullscreenSurface {
+    pub fn set(&self, window: Window) {
+        self.0.set(Some(window));
     }
 
-    if let Some(location) = window_map
-        .find(wl_surface)
-        .and_then(|kind| window_map.location(&kind))
-    {
-        if let Some(result) = output_map.find_by_position(location).map(|o| o.geometry()) {
-            return Some(result);
-        }
+    pub fn get(&self) -> Option<Window> {
+        self.0.borrow().clone()
     }
 
-    output_map.with_primary().map(|o| o.geometry())
+    pub fn clear(&self) -> Option<Window> {
+        self.0.borrow_mut().take()
+    }
 }
 
 impl ShellHandles {
-    pub fn init<B: 'static>(display: Rc<RefCell<Display>>, log: Logger) -> Self {
+    pub fn init<B: Backend + 'static>(display: Rc<RefCell<Display>>, log: Logger) -> Self {
         let display = &mut display.borrow_mut();
         compositor_init(
             display,
             move |surface, mut ddata| {
+                on_commit_buffer_handler(&surface);
                 let state = ddata.get::<State<B>>().unwrap();
-                surface_commit(&surface, &state.window_map, &state.output_map);
+                let mut popups = state.popups.borrow_mut();
+                let space = state.space.as_ref();
+                space.borrow_mut().commit(&surface);
+                surface_commit(&surface, &space, &mut popups);
             },
             log.clone(),
         );
 
-        let (xdg_state, _) = xdg_shell_init(display, xdg_shell_impl::<B>, log.clone());
-        let (wl_state, _) = wl_shell_init(display, wl_shell_impl::<B>, log.clone());
-        wlr_layer_shell_init(display, wlr_layer_shell_impl::<B>, log.clone());
+        let l = log.clone();
+        let (xdg_state, _) = xdg_shell_init(
+            display,
+            move |s, d| xdg_shell_impl::<B>(s, d, &l),
+            log.clone(),
+        );
+
+        let (layer_state, _) =
+            wlr_layer_shell_init(display, wlr_layer_shell_impl::<B>, log.clone());
 
         Self {
             xdg_state,
-            wl_state,
+            layer_state,
         }
     }
 }
 
 #[derive(Default)]
 pub struct SurfaceData {
-    pub buffer: Option<WlBuffer>,
-    pub texture: Option<Box<dyn Any + 'static>>,
     resize_state: ResizeState,
-    buffer_dimensions: Option<Size<i32, Buffer>>,
-    pub buffer_scale: i32,
-    pub buffer_transform: Transform,
+    pub buffer_dimensions: Option<Size<i32, Buffer>>,
 }
 
-impl SurfaceData {
-    fn update_buffer(&mut self, attrs: &mut SurfaceAttributes) {
-        match attrs.buffer.take() {
-            Some(BufferAssignment::NewBuffer { buffer, .. }) => {
-                self.buffer_dimensions = buffer_dimensions(&buffer);
-                self.buffer_scale = attrs.buffer_scale;
-                self.buffer_transform = attrs.buffer_transform.into();
-                if let Some(old_buffer) = self.buffer.replace(buffer) {
-                    old_buffer.release();
-                }
-                self.texture = None;
-            }
-            Some(BufferAssignment::Removed) => {
-                self.buffer = None;
-                self.buffer_dimensions = None;
-                self.texture = None;
-            }
-            None => (),
-        }
-    }
-
-    pub fn size(&self) -> Option<Size<i32, Logical>> {
-        let dims = self.buffer_dimensions?;
-        Some(dims.to_logical(self.buffer_scale, self.buffer_transform))
-    }
-
-    pub fn contains_point(&self, attrs: &SurfaceAttributes, point: Point<f64, Logical>) -> bool {
-        let size = try_or!(return false, self.size());
-        let rect = Rectangle::from_loc_and_size((0, 0), size).to_f64();
-        if !rect.contains(point) {
-            return false;
-        }
-        // if there's no input region, then the entire window works
-        let input_region = try_or!(return true, attrs.input_region.as_ref());
-        input_region.contains(point.to_i32_floor())
-    }
-
-    pub fn send_frame(attrs: &mut SurfaceAttributes, time: Duration) {
-        for callback in attrs.frame_callbacks.drain(..) {
-            callback.done(time.as_millis() as u32);
-        }
-    }
-}
-
-fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'_>) {
+fn xdg_shell_impl<B: Backend + 'static>(
+    shell_event: XdgRequest,
+    mut ddata: DispatchData<'_>,
+    log: &Logger,
+) {
     let state = ddata.get::<State<B>>().unwrap();
     match shell_event {
         XdgRequest::NewToplevel { surface } => {
-            use rand::distributions::{Distribution, Uniform};
-
-            let geometry = match state.output_map.borrow().with_primary() {
-                Some(o) => o.geometry(),
-                None => Rectangle::from_loc_and_size((0, 0), (800, 800)),
-            };
-
-            let max_x = geometry.loc.x + (((geometry.size.w as f32) / 3.0) * 2.0) as i32;
-            let max_y = geometry.loc.y + (((geometry.size.h as f32) / 3.0) * 2.0) as i32;
-            let x_range = Uniform::new(geometry.loc.x, max_x);
-            let y_range = Uniform::new(geometry.loc.y, max_y);
-            let mut rng = rand::thread_rng();
-            let x = x_range.sample(&mut rng);
-            let y = y_range.sample(&mut rng);
-            state
-                .window_map
-                .borrow_mut()
-                .insert(surface.into(), (x, y).into());
+            let window = Window::new(SurfaceKind::Xdg(surface));
+            place_new_window(&mut state.space.borrow_mut(), &window, true);
         }
 
         XdgRequest::NewPopup {
@@ -444,7 +406,10 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
             surface
                 .with_pending_state(|state| state.geometry = positioner.get_geometry())
                 .unwrap();
-            state.window_map.borrow_mut().insert_popup(surface.into());
+
+            if let Err(e) = state.popups.borrow_mut().track_popup(surface.into()) {
+                warn!(log, "Failed to track popup: {e}");
+            }
         }
 
         XdgRequest::RePosition {
@@ -485,9 +450,13 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
                 return;
             }
 
-            let toplevel = surface.clone().into();
-            let mut initial_window_location =
-                state.window_map.borrow().location(&toplevel).unwrap();
+            let space = state.space.clone();
+            let window = space
+                .borrow_mut()
+                .window_for_surface(surface.get_surface().unwrap())
+                .unwrap()
+                .clone();
+            let mut initial_window_location = space.borrow().window_geometry(&window).unwrap().loc;
 
             if let Some(cur_state) = surface.current_state() {
                 if cur_state.states.contains(xdg_toplevel::State::Maximized) {
@@ -513,8 +482,8 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
 
             let grab = MoveSurfaceGrab {
                 start_data,
-                window_map: state.window_map.clone(),
-                toplevel,
+                space,
+                window,
                 initial_window_location,
             };
 
@@ -545,9 +514,16 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
                 return;
             }
 
-            let toplevel = surface.clone().into();
-            let initial_window_location = state.window_map.borrow().location(&toplevel).unwrap();
-            let geometry = state.window_map.borrow().geometry(&toplevel).unwrap();
+            let space = state.space.clone();
+            let window = space
+                .borrow_mut()
+                .window_for_surface(surface.get_surface().unwrap())
+                .unwrap()
+                .clone();
+
+            let geometry = space.borrow().window_geometry(&window).unwrap();
+
+            let initial_window_location = geometry.loc;
             let initial_window_size = geometry.size;
 
             let edges = edges.into();
@@ -563,7 +539,7 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
 
             let grab = ResizeSurfaceGrab {
                 start_data,
-                toplevel,
+                window,
                 edges,
                 initial_window_size,
                 last_window_size: initial_window_size,
@@ -621,7 +597,9 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
         }
 
         XdgRequest::Fullscreen {
-            surface, output, ..
+            surface,
+            output: mut wl_output,
+            ..
         } => {
             let wl_surface = try_or!(return, surface.get_surface());
 
@@ -629,24 +607,38 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
                 return,
                 fullscreen_output_geometry(
                     wl_surface,
-                    output.as_ref(),
-                    &state.window_map.borrow(),
-                    &state.output_map.borrow(),
+                    wl_output.as_ref(),
+                    &mut state.space.borrow_mut(),
                 ),
             );
 
-            let mut window_map = state.window_map.borrow_mut();
-            if let Some(kind) = window_map.find(wl_surface) {
-                window_map.set_location(&kind, geometry.loc);
-            }
+            let space = state.space.borrow_mut();
+            let output = wl_output
+                .as_ref()
+                .and_then(Output::from_resource)
+                .unwrap_or_else(|| space.outputs().next().unwrap().clone());
+
+            output.with_client_outputs(wl_surface.as_ref().client().unwrap(), |o| {
+                wl_output = Some(o.clone())
+            });
 
             let ret = surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
                 state.size = Some(geometry.size);
-                state.fullscreen_output = output;
+                state.fullscreen_output = wl_output;
             });
             if ret.is_ok() {
-                surface.send_configure();
+                let window = space.window_for_surface(wl_surface).unwrap();
+                window.configure();
+                output
+                    .user_data()
+                    .insert_if_missing(FullscreenSurface::default);
+                output
+                    .user_data()
+                    .get::<FullscreenSurface>()
+                    .unwrap()
+                    .set(window.clone());
+                trace!(log, "Fullscreening: {window:?}");
             }
         }
 
@@ -654,9 +646,17 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
             let ret = surface.with_pending_state(|state| {
                 state.states.unset(xdg_toplevel::State::Fullscreen);
                 state.size = None;
-                state.fullscreen_output = None;
+                state.fullscreen_output.take()
             });
-            if ret.is_ok() {
+            if let Ok(output) = ret {
+                if let Some(output) = output {
+                    let output = Output::from_resource(&output).unwrap();
+                    if let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() {
+                        trace!(log, "Unfullscreening: {:?}", fullscreen.get());
+                        fullscreen.clear();
+                        state.backend_data.reset_buffers(&output);
+                    }
+                }
                 surface.send_configure();
             }
         }
@@ -665,22 +665,15 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
             // NOTE: This should use layer-shell when it is implemented
             // to get the correct maximum size
 
-            let mut window_map = state.window_map.borrow_mut();
+            let mut space = state.space.borrow_mut();
+            let window = space
+                .window_for_surface(surface.get_surface().unwrap())
+                .unwrap()
+                .clone();
+            let output = &space.outputs_for_window(&window)[0];
+            let geometry = space.output_geometry(output).unwrap();
 
-            let wl_surface = try_or!(return, surface.get_surface());
-            let kind = try_or!(return, window_map.find(wl_surface));
-
-            let geometry = {
-                let output_map = state.output_map.borrow();
-
-                let position = try_or!(return, window_map.location(&kind));
-                let output = try_or!(return, output_map.find_by_position(position));
-                output.geometry()
-            };
-
-            if let Some(kind) = window_map.find(wl_surface) {
-                window_map.set_location(&kind, geometry.loc);
-            }
+            space.map_window(&window, geometry.loc, true);
 
             let ret = surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Maximized);
@@ -699,145 +692,46 @@ fn xdg_shell_impl<B: 'static>(shell_event: XdgRequest, mut ddata: DispatchData<'
                 surface.send_configure();
             }
         }
-        _ => (),
-    }
-}
-
-fn wl_shell_impl<B: 'static>(req: ShellRequest, mut ddata: DispatchData<'_>) {
-    let state = ddata.get::<State<B>>().unwrap();
-    match req {
-        ShellRequest::SetKind {
+        XdgRequest::Grab {
+            serial,
             surface,
-            kind: ShellSurfaceKind::Toplevel,
+            seat,
         } => {
-            // place the window at a random location on the primary output
-            // or if there is not output in a [0;800]x[0;800] square
-            use rand::distributions::{Distribution, Uniform};
-
-            let geometry = match state.output_map.borrow().with_primary() {
-                Some(o) => o.geometry(),
-                None => Rectangle::from_loc_and_size((0, 0), (800, 800)),
-            };
-
-            let max_x = geometry.loc.x + (((geometry.size.w as f32) / 3.0) * 2.0) as i32;
-            let max_y = geometry.loc.y + (((geometry.size.h as f32) / 3.0) * 2.0) as i32;
-            let x_range = Uniform::new(geometry.loc.x, max_x);
-            let y_range = Uniform::new(geometry.loc.y, max_y);
-            let mut rng = rand::thread_rng();
-            let x = x_range.sample(&mut rng);
-            let y = y_range.sample(&mut rng);
-            state
-                .window_map
+            let seat = Seat::from_resource(&seat).unwrap();
+            let ret = state
+                .popups
                 .borrow_mut()
-                .insert(SurfaceKind::Wl(surface), (x, y).into());
-        }
-        ShellRequest::SetKind {
-            surface,
-            kind: ShellSurfaceKind::Fullscreen { output, .. },
-        } => {
-            // NOTE: This is only one part of the solution. We can set the
-            // location and configure size here, but the surface should be rendered fullscreen
-            // independently from its buffer size
-            let wl_surface = try_or!(return, surface.get_surface());
+                .grab_popup(surface.into(), &seat, serial);
 
-            let geometry = fullscreen_output_geometry(
-                wl_surface,
-                output.as_ref(),
-                &state.window_map.borrow(),
-                &state.output_map.borrow(),
-            );
+            let mut grab = try_or!(return, ret.ok());
+            let prev = grab.previous_serial().unwrap_or(serial);
 
-            if let Some(geometry) = geometry {
-                state
-                    .window_map
-                    .borrow_mut()
-                    .insert(surface.into(), geometry.loc);
-            }
-        }
-        ShellRequest::Move {
-            surface,
-            seat,
-            serial,
-        } => {
-            let seat = Seat::from_resource(&seat).unwrap();
-            // TODO: touch move
-            let pointer = seat.get_pointer().unwrap();
-
-            if !pointer.has_grab(serial) {
-                return;
+            if let Some(keyboard) = seat.get_keyboard() {
+                let (is_grabbed, has_grab, had_grab) = (
+                    keyboard.is_grabbed(),
+                    keyboard.has_grab(serial),
+                    keyboard.has_grab(prev),
+                );
+                if is_grabbed && !(has_grab || had_grab) {
+                    grab.ungrab(PopupUngrabStrategy::All);
+                    return;
+                }
+                keyboard.set_focus(grab.current_grab().as_ref(), serial);
+                keyboard.set_grab(PopupKeyboardGrab::new(&grab), serial);
             }
 
-            let start_data = pointer.grab_start_data().unwrap();
-
-            let (focus, _) = try_or!(return, start_data.focus.as_ref());
-            if !focus
-                .as_ref()
-                .same_client_as(surface.get_surface().unwrap().as_ref())
-            {
-                return;
+            if let Some(pointer) = seat.get_pointer() {
+                let (is_grabbed, has_grab, had_grab) = (
+                    pointer.is_grabbed(),
+                    pointer.has_grab(serial),
+                    pointer.has_grab(prev),
+                );
+                if is_grabbed && !(has_grab || had_grab) {
+                    grab.ungrab(PopupUngrabStrategy::All);
+                    return;
+                }
+                pointer.set_grab(PopupPointerGrab::new(&grab), serial, 0);
             }
-
-            let toplevel = surface.into();
-            let initial_window_location = state.window_map.borrow().location(&toplevel).unwrap();
-
-            let grab = MoveSurfaceGrab {
-                start_data,
-                window_map: state.window_map.clone(),
-                toplevel,
-                initial_window_location,
-            };
-
-            pointer.set_grab(grab, serial, 0);
-        }
-        ShellRequest::Resize {
-            surface,
-            seat,
-            serial,
-            edges,
-        } => {
-            let seat = Seat::from_resource(&seat).unwrap();
-            // TODO: touch resize
-            let pointer = seat.get_pointer().unwrap();
-
-            if !pointer.has_grab(serial) {
-                return;
-            }
-
-            let start_data = pointer.grab_start_data().unwrap();
-
-            let (focus, _) = try_or!(return, start_data.focus.as_ref());
-            if !focus
-                .as_ref()
-                .same_client_as(surface.get_surface().unwrap().as_ref())
-            {
-                return;
-            }
-
-            let toplevel = surface.clone().into();
-            let initial_window_location = state.window_map.borrow().location(&toplevel).unwrap();
-            let geometry = state.window_map.borrow().geometry(&toplevel).unwrap();
-            let initial_window_size = geometry.size;
-            let edges = edges.into();
-
-            with_states(surface.get_surface().unwrap(), move |states| {
-                let data = states.data_map.get::<RefCell<SurfaceData>>().unwrap();
-                data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
-                    edges,
-                    initial_window_location,
-                    initial_window_size,
-                });
-            })
-            .unwrap();
-
-            let grab = ResizeSurfaceGrab {
-                start_data,
-                toplevel,
-                edges,
-                initial_window_size,
-                last_window_size: initial_window_size,
-            };
-
-            pointer.set_grab(grab, serial, 0);
         }
         _ => (),
     }
@@ -847,48 +741,35 @@ fn wlr_layer_shell_impl<B: 'static>(event: LayerShellRequest, mut ddata: Dispatc
     match event {
         LayerShellRequest::NewLayerSurface {
             surface,
-            output,
-            layer,
-            namespace: _,
+            output: wl_output,
+            namespace,
+            ..
         } => {
             let state = ddata.get::<State<B>>().unwrap();
-            let output_map = state.output_map.borrow();
-
-            let output = output
-                .and_then(|o| output_map.find_by_output(&o))
-                .or_else(|| output_map.find_by_position(state.pointer_location.to_i32_round()))
-                .or_else(|| output_map.with_primary())
+            let space = state.space.borrow();
+            let output = wl_output
+                .as_ref()
+                .and_then(Output::from_resource)
+                .or_else(|| space.outputs().next().cloned())
                 .unwrap();
 
-            let wl_surface = try_or!(return, surface.get_surface());
-            output.add_layer_surface(wl_surface.clone());
-            state.window_map.borrow_mut().layers.insert(surface, layer);
+            let mut map = layer_map_for_output(&output);
+            map.map_layer(&LayerSurface::new(surface, namespace))
+                .unwrap();
         }
         LayerShellRequest::AckConfigure { .. } => (),
     }
 }
 
-fn surface_commit(
-    surface: &WlSurface,
-    window_map: &RefCell<WindowMap>,
-    output_map: &RefCell<OutputMap>,
-) {
+fn surface_commit(surface: &WlSurface, space: &RefCell<Space>, popups: &mut PopupManager) {
     super::xwayland::commit_hook(surface);
-    let mut window_map = window_map.borrow_mut();
+    let mut space = space.borrow_mut();
 
-    if !is_sync_subsurface(surface) {
-        with_surface_tree_upward_all(surface, |_, states| {
-            states
-                .data_map
-                .insert_if_missing::<RefCell<SurfaceData>, _>(Default::default);
-            let mut data = states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut();
-            data.update_buffer(&mut states.cached_state.current::<SurfaceAttributes>());
-        });
-    }
+    with_surface_tree_upward_all(surface, |_, states| {
+        states
+            .data_map
+            .insert_if_missing(RefCell::<SurfaceData>::default);
+    });
 
     macro_rules! ics {
         ($t:ty) => {
@@ -900,16 +781,14 @@ fn surface_commit(
         };
     }
 
-    if let Some(toplevel) = window_map.find(surface) {
-        if let SurfaceKind::Xdg(toplevel) = &toplevel {
+    if let Some(window) = space.window_for_surface(surface) {
+        if let SurfaceKind::Xdg(toplevel) = window.toplevel() {
             if !ics!(XdgToplevelSurfaceRoleAttributes) {
                 toplevel.send_configure();
             }
         }
 
-        window_map.refresh_toplevel(&toplevel);
-
-        let geometry = window_map.geometry(&toplevel).unwrap();
+        let geometry = space.window_geometry(window).unwrap();
         let new_location = with_states(surface, |states| {
             let mut data = states
                 .data_map
@@ -930,7 +809,7 @@ fn surface_commit(
                     } = resize_data;
 
                     if edges.intersects(ResizeEdge::TOP_LEFT) {
-                        let mut location = window_map.location(&toplevel).unwrap();
+                        let mut location = geometry.loc;
 
                         if edges.intersects(ResizeEdge::LEFT) {
                             location.x = initial_window_location.x
@@ -956,24 +835,97 @@ fn surface_commit(
         .unwrap();
 
         if let Some(location) = new_location {
-            window_map.set_location(&toplevel, location);
+            let window = window.clone();
+            space.map_window(&window, location, true);
         }
+
+        return;
     }
 
-    if let Some(popup) = window_map.find_popup(surface) {
+    if let Some(popup) = popups.find_popup(surface) {
         let PopupKind::Xdg(popup) = popup;
         if !ics!(XdgPopupSurfaceRoleAttributes) {
             popup.send_configure().unwrap();
         }
+        return;
     }
 
-    if let Some(layer) = window_map.layers.find(surface) {
+    if let Some(output) = space
+        .outputs()
+        .find(|o| layer_map_for_output(o).layer_for_surface(surface).is_some())
+        .cloned()
+    {
+        let mut map = layer_map_for_output(&output);
+        let layer = map.layer_for_surface(surface).unwrap();
+
         if !ics!(LayerSurfaceAttributes) {
-            layer.surface.send_configure();
+            layer.layer_surface().send_configure();
         }
 
-        if let Some(output) = output_map.borrow().find_by_layer_surface(surface) {
-            window_map.layers.arrange_layers(output);
+        map.arrange();
+    };
+}
+
+fn place_new_window(space: &mut Space, window: &Window, activate: bool) {
+    use rand::distributions::{Distribution, Uniform};
+
+    let geometry = space
+        .outputs()
+        .next()
+        .cloned()
+        .and_then(|o| {
+            let g = space.output_geometry(&o)?;
+            let m = layer_map_for_output(&o);
+            let z = m.non_exclusive_zone();
+            Some(Rectangle::from_loc_and_size(g.loc + z.loc, z.size))
+        })
+        .unwrap_or(Rectangle::from_loc_and_size((0, 0), (800, 800)));
+
+    let max_x = geometry.loc.x + (((geometry.size.w as f32) / 3.0) * 2.0) as i32;
+    let max_y = geometry.loc.y + (((geometry.size.h as f32) / 3.0) * 2.0) as i32;
+    let x_range = Uniform::new(geometry.loc.x, max_x);
+    let y_range = Uniform::new(geometry.loc.y, max_y);
+    let mut rng = rand::thread_rng();
+    let x = x_range.sample(&mut rng);
+    let y = y_range.sample(&mut rng);
+
+    space.map_window(window, (x, y), activate);
+}
+
+pub fn fixup_positions(space: &mut Space) {
+    let mut offset = Point::<i32, Logical>::default();
+
+    let outputs = space.outputs().cloned().collect::<Vec<_>>();
+    for output in &outputs {
+        let size = space
+            .output_geometry(output)
+            .map(|g| g.size)
+            .unwrap_or_default();
+        let scale = space.output_scale(output).unwrap_or_default();
+        space.map_output(output, scale, offset);
+        layer_map_for_output(output).arrange();
+        offset.x += size.w;
+    }
+
+    let boxes = outputs
+        .iter()
+        .flat_map(|o| {
+            let g = space.output_geometry(&o)?;
+            let m = layer_map_for_output(&o);
+            let z = m.non_exclusive_zone();
+            Some(Rectangle::from_loc_and_size(g.loc + z.loc, z.size))
+        })
+        .collect::<Vec<_>>();
+
+    let mut orphaned_windows = Vec::new();
+    for window in space.windows() {
+        let window_geo = try_or!(continue, space.window_geometry(window));
+        if !boxes.iter().any(|g| g.contains(window_geo.loc)) {
+            orphaned_windows.push(window.clone());
         }
+    }
+
+    for window in orphaned_windows {
+        place_new_window(space, &window, false)
     }
 }

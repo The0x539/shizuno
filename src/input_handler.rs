@@ -1,27 +1,38 @@
 use std::process::Command;
 
-use smithay::backend::{
-    input::{
-        self, Device, DeviceCapability, Event, InputBackend, InputEvent, KeyState,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, ProximityState,
-        TabletToolButtonEvent, TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent,
-        TabletToolTipState,
-    },
-    session::Session,
-};
+use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
 use smithay::reexports::*;
 use smithay::utils::{Logical, Point};
+use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::{
+    compositor::with_states,
     seat::{AxisFrame, FilterResult, KeysymHandle, ModifiersState},
+    shell::wlr_layer::LayerSurfaceCachedState,
     tablet_manager::TabletSeatTrait,
     Serial,
 };
+use smithay::{
+    backend::{
+        input::{
+            self, Device, DeviceCapability, Event, InputBackend, InputEvent, KeyState,
+            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+            ProximityState, TabletToolButtonEvent, TabletToolEvent, TabletToolProximityEvent,
+            TabletToolTipEvent, TabletToolTipState,
+        },
+        session::Session,
+    },
+    wayland::shell::wlr_layer::KeyboardInteractivity,
+};
 
 use slog::{debug, error, info};
-use wayland_server::protocol::wl_pointer;
+use wayland_server::protocol::{wl_pointer, wl_surface::WlSurface};
 use xkbcommon::xkb::Keysym;
 
-use crate::{state::State, udev::UdevData};
+use crate::shell::FullscreenSurface;
+use crate::{
+    state::{Backend, State},
+    udev::UdevData,
+};
 
 fn scounter() -> Serial {
     smithay::wayland::SERIAL_COUNTER.next_serial()
@@ -38,11 +49,38 @@ enum KeyAction {
     None,
 }
 
-impl<B> State<B> {
+impl<B: Backend> State<B> {
     fn keyboard_key_to_action<I: InputBackend>(&mut self, evt: I::KeyboardKeyEvent) -> KeyAction {
         let keycode = evt.key_code();
         let state = evt.state();
+        let serial = scounter();
+        let time = evt.time();
         debug!(self.log, "key"; "keycode" => keycode, "state" => format!("{state:?}"));
+
+        for layer in self
+            .shells
+            .layer_state
+            .lock()
+            .unwrap()
+            .layer_surfaces()
+            .iter()
+            .rev()
+        {
+            let surface = try_or!(continue, layer.get_surface());
+            let data = with_states(surface, |states| {
+                *states.cached_state.current::<LayerSurfaceCachedState>()
+            })
+            .unwrap();
+            if data.keyboard_interactivity == KeyboardInteractivity::Exclusive
+                && matches!(data.layer, Layer::Top | Layer::Overlay)
+            {
+                self.keyboard
+                    .set_focus(Some(layer.get_surface().unwrap()), serial);
+                self.keyboard
+                    .input::<(), _>(keycode, state, serial, time, |_, _| FilterResult::Forward);
+                return KeyAction::None;
+            }
+        }
 
         let filter = |modifiers: &_, handle: KeysymHandle<'_>| {
             let keysym = handle.modified_sym();
@@ -72,24 +110,30 @@ impl<B> State<B> {
         };
 
         self.keyboard
-            .input(keycode, state, scounter(), evt.time(), filter)
+            .input(keycode, state, serial, time, filter)
             .unwrap_or(KeyAction::None)
     }
 
-    fn change_scale(&mut self, delta: f32) {
-        let mut output_map = self.output_map.borrow_mut();
+    fn change_scale(&mut self, delta: f64) {
+        let mut space = self.space.borrow_mut();
 
-        let ptr_loc = self.pointer_location.to_i32_round();
-        let output = try_or!(return, output_map.find_by_position(ptr_loc));
+        let pos = self.pointer_location.to_i32_round();
+        let output = try_or!(
+            return,
+            space
+                .outputs()
+                .find(|o| space.output_geometry(o).unwrap().contains(pos))
+                .cloned(),
+        );
 
-        let scale = output.scale();
-        let output_location = output.location().to_f64();
-        let name = output.name().to_owned();
+        let scale = space.output_scale(&output).unwrap();
+        let output_location = space.output_geometry(&output).unwrap().loc;
 
         let new_scale = (scale + delta).max(1.0);
+        output.change_current_state(None, None, Some(new_scale.ceil() as i32), None);
+        space.map_output(&output, new_scale, output_location);
 
-        output_map.update_scale_by_name(new_scale, name);
-
+        let output_location = output_location.to_f64();
         let factor = scale as f64 / new_scale as f64;
         let mut pointer_output_location = self.pointer_location - output_location;
         pointer_output_location.x *= factor;
@@ -97,29 +141,158 @@ impl<B> State<B> {
         self.pointer_location = output_location + pointer_output_location;
         let ptr_loc = self.pointer_location;
 
-        let under = self.window_map.borrow().get_surface_under(ptr_loc);
+        crate::shell::fixup_positions(&mut space);
+        drop(space);
+        let under = self.surface_under();
         self.pointer.motion(ptr_loc, under, scounter(), 0);
+        self.backend_data.reset_buffers(&output);
     }
 
     fn on_pointer_button<I: InputBackend>(&mut self, evt: I::PointerButtonEvent) {
         let serial = scounter();
-
-        if evt.state() == input::ButtonState::Pressed && !self.pointer.is_grabbed() {
-            let under = self
-                .window_map
-                .borrow_mut()
-                .get_surface_and_bring_to_top(self.pointer_location);
-            let surface = under.as_ref().map(|s| &s.0);
-            self.keyboard.set_focus(surface, serial);
-        }
 
         let state = match evt.state() {
             input::ButtonState::Pressed => wl_pointer::ButtonState::Pressed,
             input::ButtonState::Released => wl_pointer::ButtonState::Released,
         };
 
+        if state == wl_pointer::ButtonState::Pressed {
+            self.update_keyboard_focus(serial);
+        }
+
         let button = evt.button_code();
         self.pointer.button(button, state, serial, evt.time());
+    }
+
+    fn update_keyboard_focus(&mut self, serial: Serial) {
+        if self.pointer.is_grabbed() {
+            return;
+        }
+
+        let mut space = self.space.borrow_mut();
+
+        if let Some(output) = space.output_under(self.pointer_location).next() {
+            let output_geo = space.output_geometry(output).unwrap();
+            if let Some(window) = output
+                .user_data()
+                .get::<FullscreenSurface>()
+                .and_then(|f| f.get())
+            {
+                let surface = window
+                    .surface_under(
+                        self.pointer_location - output_geo.loc.to_f64(),
+                        WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                    )
+                    .map(|(s, _)| s);
+                self.keyboard.set_focus(surface.as_ref(), serial);
+                return;
+            }
+
+            let layers = layer_map_for_output(output);
+            if let Some(layer) = layers
+                .layer_under(Layer::Overlay, self.pointer_location)
+                .or_else(|| layers.layer_under(Layer::Top, self.pointer_location))
+            {
+                if layer.can_receive_keyboard_focus() {
+                    let surface = layer
+                        .surface_under(
+                            self.pointer_location
+                                - output_geo.loc.to_f64()
+                                - layers.layer_geometry(layer).unwrap().loc.to_f64(),
+                            WindowSurfaceType::ALL,
+                        )
+                        .map(|(s, _)| s);
+                    self.keyboard.set_focus(surface.as_ref(), serial);
+                    return;
+                }
+            }
+        }
+
+        if let Some(window) = space.window_under(self.pointer_location).cloned() {
+            space.raise_window(&window, true);
+            let window_loc = space.window_geometry(&window).unwrap().loc;
+            let surface = window
+                .surface_under(
+                    self.pointer_location - window_loc.to_f64(),
+                    WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                )
+                .map(|(s, _)| s);
+            self.keyboard.set_focus(surface.as_ref(), serial);
+            return;
+        }
+
+        if let Some(output) = space.output_under(self.pointer_location).next() {
+            let output_geo = space.output_geometry(output).unwrap();
+            let layers = layer_map_for_output(output);
+            if let Some(layer) = layers
+                .layer_under(Layer::Bottom, self.pointer_location)
+                .or_else(|| layers.layer_under(Layer::Background, self.pointer_location))
+            {
+                if layer.can_receive_keyboard_focus() {
+                    let surface = layer
+                        .surface_under(
+                            self.pointer_location
+                                - output_geo.loc.to_f64()
+                                - layers.layer_geometry(layer).unwrap().loc.to_f64(),
+                            WindowSurfaceType::ALL,
+                        )
+                        .map(|(s, _)| s);
+                    self.keyboard.set_focus(surface.as_ref(), serial);
+                }
+            }
+        };
+    }
+
+    pub fn surface_under(&self) -> Option<(WlSurface, Point<i32, Logical>)> {
+        let pos = self.pointer_location;
+        let space = self.space.borrow();
+        let output = space.outputs().find(|o| {
+            let geometry = space.output_geometry(o).unwrap();
+            geometry.contains(pos.to_i32_round())
+        })?;
+        let output_geo = space.output_geometry(output).unwrap();
+        let layers = layer_map_for_output(output);
+
+        if let Some(window) = output
+            .user_data()
+            .get::<FullscreenSurface>()
+            .and_then(|f| f.get())
+        {
+            return window.surface_under(pos - output_geo.loc.to_f64(), WindowSurfaceType::ALL);
+        }
+
+        if let Some(layer) = layers
+            .layer_under(Layer::Overlay, pos)
+            .or_else(|| layers.layer_under(Layer::Top, pos))
+        {
+            let layer_loc = layers.layer_geometry(layer).unwrap().loc;
+            let (s, loc) = layer.surface_under(
+                pos - output_geo.loc.to_f64() - layer_loc.to_f64(),
+                WindowSurfaceType::ALL,
+            )?;
+            return Some((s, loc + layer_loc));
+        }
+
+        if let Some(window) = space.window_under(pos) {
+            let window_loc = space.window_geometry(window).unwrap().loc;
+            let (s, loc) =
+                window.surface_under(pos - window_loc.to_f64(), WindowSurfaceType::ALL)?;
+            return Some((s, loc + window_loc));
+        }
+
+        if let Some(layer) = layers
+            .layer_under(Layer::Bottom, pos)
+            .or_else(|| layers.layer_under(Layer::Background, pos))
+        {
+            let layer_loc = layers.layer_geometry(layer).unwrap().loc;
+            let (s, loc) = layer.surface_under(
+                pos - output_geo.loc.to_f64() - layer_loc.to_f64(),
+                WindowSurfaceType::ALL,
+            )?;
+            return Some((s, loc + layer_loc));
+        }
+
+        None
     }
 
     fn on_pointer_axis<I: InputBackend>(&mut self, evt: I::PointerAxisEvent) {
@@ -187,9 +360,9 @@ impl State<UdevData> {
                     }
                 }
                 KeyAction::Screen(num) => {
-                    let output_map = self.output_map.borrow();
-                    let output = try_or!(return, output_map.find_by_index(num));
-                    let geometry = output.geometry();
+                    let space = self.space.borrow();
+                    let output = try_or!(return, space.outputs().nth(num));
+                    let geometry = space.output_geometry(output).unwrap();
                     let x = geometry.loc.x as f64 + geometry.size.w as f64 / 2.0;
                     // TODO: assumes horizontal lineup layout
                     let y = geometry.size.h as f64 / 2.0;
@@ -232,21 +405,20 @@ impl State<UdevData> {
         let ptr_loc = self.clamp_coords(self.pointer_location + evt.delta());
         self.pointer_location = ptr_loc;
 
-        let under = self.window_map.borrow().get_surface_under(ptr_loc);
+        let under = self.surface_under();
         self.pointer.motion(ptr_loc, under, serial, evt.time());
     }
 
     fn on_tablet_tool_axis<I: InputBackend>(&mut self, evt: I::TabletToolAxisEvent) {
-        let output_map = self.output_map.borrow();
         let tablet_seat = self.seat.tablet_seat();
-        let window_map = self.window_map.borrow();
 
-        let output = try_or!(return, output_map.with_primary());
-        let rect = output.geometry();
+        let space = self.space.borrow();
+        let output = try_or!(return, space.outputs().next());
+        let rect = space.output_geometry(output).unwrap();
 
         self.pointer_location = evt.position_transformed(rect.size) + rect.loc.to_f64();
 
-        let under = window_map.get_surface_under(self.pointer_location);
+        let under = self.surface_under();
 
         let tablet = try_or!(return, tablet_seat.get_tablet(&(&evt.device()).into()));
         let tool = try_or!(return, tablet_seat.get_tool(&evt.tool()));
@@ -278,19 +450,18 @@ impl State<UdevData> {
     }
 
     fn on_tablet_tool_proximity<I: InputBackend>(&mut self, evt: I::TabletToolProximityEvent) {
-        let output_map = self.output_map.borrow();
         let tablet_seat = self.seat.tablet_seat();
-        let window_map = self.window_map.borrow();
+        let space = self.space.borrow();
 
-        let output = try_or!(return, output_map.with_primary());
-        let rect = output.geometry();
+        let output = try_or!(return, space.outputs().next());
+        let rect = space.output_geometry(output).unwrap();
 
         let tool = evt.tool();
         tablet_seat.add_tool(&tool);
 
         self.pointer_location = evt.position_transformed(rect.size) + rect.loc.to_f64();
 
-        let under = try_or!(return, window_map.get_surface_under(self.pointer_location));
+        let under = try_or!(return, self.surface_under());
         let tablet = try_or!(return, tablet_seat.get_tablet(&(&evt.device()).into()));
         let tool = try_or!(return, tablet_seat.get_tool(&tool));
 
@@ -311,17 +482,9 @@ impl State<UdevData> {
 
         match evt.tip_state() {
             TabletToolTipState::Down => {
-                tool.tip_down(scounter(), evt.time());
-
-                if !self.pointer.is_grabbed() {
-                    let under = self
-                        .window_map
-                        .borrow_mut()
-                        .get_surface_and_bring_to_top(self.pointer_location);
-
-                    let surface = under.as_ref().map(|s| &s.0);
-                    self.keyboard.set_focus(surface, scounter());
-                }
+                let serial = scounter();
+                tool.tip_down(serial, evt.time());
+                self.update_keyboard_focus(serial);
             }
             TabletToolTipState::Up => tool.tip_up(evt.time()),
         }
@@ -333,17 +496,29 @@ impl State<UdevData> {
     }
 
     fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
-        if self.output_map.borrow().is_empty() {
+        let space = self.space.borrow();
+        if space.outputs().next().is_none() {
             return pos;
         }
 
         let (pos_x, pos_y) = pos.into();
-        let output_map = self.output_map.borrow();
 
-        let max_x = output_map.width();
+        // TODO: layout assumption here too
+
+        let max_x = space
+            .outputs()
+            .map(|o| space.output_geometry(o).unwrap().size.w)
+            .sum::<i32>();
         let clamped_x = pos_x.clamp(0.0, max_x as f64);
 
-        let max_y = output_map.height(clamped_x as i32);
+        let max_y = space.outputs().find_map(|o| {
+            let geo = space.output_geometry(o).unwrap();
+            if geo.contains((clamped_x as i32, 0)) {
+                Some(geo.size.h)
+            } else {
+                None
+            }
+        });
         let clamped_y = pos_y.clamp(0.0, max_y.map_or(f64::MAX, f64::from));
 
         (clamped_x, clamped_y).into()
