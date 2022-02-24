@@ -12,7 +12,7 @@ use smithay::backend::{
 use smithay::reexports::*;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::{
-    seat::{AxisFrame, FilterResult, ModifiersState},
+    seat::{AxisFrame, FilterResult, KeysymHandle, ModifiersState},
     tablet_manager::TabletSeatTrait,
     Serial,
 };
@@ -44,38 +44,35 @@ impl<B> State<B> {
         let state = evt.state();
         debug!(self.log, "key"; "keycode" => keycode, "state" => format!("{state:?}"));
 
-        self.keyboard
-            .input(
-                keycode,
-                state,
-                scounter(),
-                evt.time(),
-                // TODO: de-inline this closure again once it's possible to name `handle`'s datatype
-                |modifiers, handle| {
-                    let keysym = handle.modified_sym();
+        let filter = |modifiers: &_, handle: KeysymHandle<'_>| {
+            let keysym = handle.modified_sym();
 
-                    debug!(self.log, "keysym";
-                        "state" => format!("{state:?}"),
-                        "mods" => format!("{modifiers:?}"),
-                        "keysym" => xkbcommon::xkb::keysym_get_name(keysym)
-                    );
+            debug!(self.log, "keysym";
+                "state" => format!("{state:?}"),
+                "mods" => format!("{modifiers:?}"),
+                "keysym" => xkbcommon::xkb::keysym_get_name(keysym)
+            );
 
-                    if state == KeyState::Pressed {
-                        if let Some(action) = process_keyboard_shortcut(*modifiers, keysym) {
-                            self.suppressed_keys.insert(keysym);
-                            FilterResult::Intercept(action)
-                        } else {
-                            FilterResult::Forward
-                        }
-                    } else {
-                        if self.suppressed_keys.remove(&keysym) {
-                            FilterResult::Intercept(KeyAction::None)
-                        } else {
-                            FilterResult::Forward
-                        }
+            match state {
+                KeyState::Pressed => {
+                    if let Some(action) = process_keyboard_shortcut(*modifiers, keysym) {
+                        self.suppressed_keys.insert(keysym);
+                        return FilterResult::Intercept(action);
                     }
-                },
-            )
+                }
+
+                KeyState::Released => {
+                    if self.suppressed_keys.remove(&keysym) {
+                        return FilterResult::Intercept(KeyAction::None);
+                    }
+                }
+            }
+
+            FilterResult::Forward
+        };
+
+        self.keyboard
+            .input(keycode, state, scounter(), evt.time(), filter)
             .unwrap_or(KeyAction::None)
     }
 

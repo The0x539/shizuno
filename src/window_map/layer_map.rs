@@ -147,28 +147,17 @@ impl LayerMap {
     }
 
     pub fn find(&self, surface: &WlSurface) -> Option<&LayerSurface> {
-        for l in &self.surfaces {
-            if let Some(s) = l.surface.get_surface() {
-                if s.as_ref().equals(surface.as_ref()) {
-                    return Some(l);
-                }
-            }
-        }
-        None
+        self.surfaces
+            .iter()
+            .find(|l| l.surface.get_surface() == Some(surface))
     }
 
     pub fn arrange_layers(&mut self, output: &Output) {
         let output_rect = output.geometry();
 
-        let surfaces = output
-            .layer_surfaces()
-            .iter()
-            .map(|s| s.as_ref().clone())
-            .collect::<Vec<_>>();
-
         for layer in &mut self.surfaces {
             let surface = try_or!(continue, layer.surface.get_surface());
-            if !surfaces.contains(surface.as_ref()) {
+            if !output.layer_surfaces().contains(surface) {
                 continue;
             }
 
@@ -197,9 +186,7 @@ impl LayerMap {
 
             layer
                 .surface
-                .with_pending_state(|state| {
-                    state.size = Some(output_rect.size);
-                })
+                .with_pending_state(|state| state.size = Some(output_rect.size))
                 .unwrap();
             layer.surface.send_configure();
         }

@@ -163,12 +163,10 @@ impl WindowMap {
     }
 
     pub fn bring_surface_to_top(&mut self, surface: &WlSurface) {
-        for (i, w) in self.windows.iter().enumerate() {
-            if let Some(s) = w.toplevel.get_surface() {
-                if s.as_ref().equals(surface.as_ref()) {
-                    self.bring_nth_window_to_top(i);
-                    return;
-                }
+        for (i, window) in self.windows.iter().enumerate() {
+            if window.toplevel.get_surface() == Some(surface) {
+                self.bring_nth_window_to_top(i);
+                return;
             }
         }
     }
@@ -224,8 +222,7 @@ impl WindowMap {
 
     pub fn find(&self, surface: &WlSurface) -> Option<Kind> {
         for window in &self.windows {
-            let s = try_or!(continue, window.toplevel.get_surface());
-            if s.as_ref().equals(surface.as_ref()) {
+            if window.toplevel.get_surface() == Some(surface) {
                 return Some(window.toplevel.clone());
             }
         }
@@ -234,8 +231,7 @@ impl WindowMap {
 
     pub fn find_popup(&self, surface: &WlSurface) -> Option<PopupKind> {
         for p in &self.popups {
-            let s = try_or!(continue, p.popup.get_surface());
-            if s.as_ref().equals(surface.as_ref()) {
+            if p.popup.get_surface() == Some(surface) {
                 return Some(p.popup.clone());
             }
         }

@@ -183,12 +183,7 @@ impl OutputMap {
     }
 
     pub fn find_by_layer_surface(&self, surface: &WlSurface) -> Option<&Output> {
-        self.find(|o| {
-            o.layer_surfaces
-                .borrow()
-                .iter()
-                .any(|s| s.as_ref().equals(surface.as_ref()))
-        })
+        self.find(|o| o.layer_surfaces.borrow().contains(surface))
     }
 
     #[allow(dead_code)] // only used in winit
