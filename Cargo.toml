@@ -35,9 +35,9 @@ features = [
     "backend_libinput",
     "backend_session_logind",
     "backend_udev",
-    "backend_x11",
     "renderer_gl",
     "use_system_lib",
     "wayland_frontend",
+    "x11rb_event_source",
     "xwayland",
 ]
