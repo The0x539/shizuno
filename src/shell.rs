@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use smithay::backend::renderer::buffer_dimensions;
 use smithay::reexports::*;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
+use smithay::utils::{Buffer, Logical, Point, Rectangle, Size, Transform};
 use smithay::wayland::{
     compositor::{
         compositor_init, is_sync_subsurface, with_states, BufferAssignment, SurfaceAttributes,
@@ -358,8 +358,9 @@ pub struct SurfaceData {
     pub buffer: Option<WlBuffer>,
     pub texture: Option<Box<dyn Any + 'static>>,
     resize_state: ResizeState,
-    buffer_dimensions: Option<Size<i32, Physical>>,
+    buffer_dimensions: Option<Size<i32, Buffer>>,
     pub buffer_scale: i32,
+    pub buffer_transform: Transform,
 }
 
 impl SurfaceData {
@@ -368,6 +369,7 @@ impl SurfaceData {
             Some(BufferAssignment::NewBuffer { buffer, .. }) => {
                 self.buffer_dimensions = buffer_dimensions(&buffer);
                 self.buffer_scale = attrs.buffer_scale;
+                self.buffer_transform = attrs.buffer_transform.into();
                 if let Some(old_buffer) = self.buffer.replace(buffer) {
                     old_buffer.release();
                 }
@@ -384,7 +386,7 @@ impl SurfaceData {
 
     pub fn size(&self) -> Option<Size<i32, Logical>> {
         let dims = self.buffer_dimensions?;
-        Some(dims.to_logical(self.buffer_scale))
+        Some(dims.to_logical(self.buffer_scale, self.buffer_transform))
     }
 
     pub fn contains_point(&self, attrs: &SurfaceAttributes, point: Point<f64, Logical>) -> bool {

@@ -11,7 +11,7 @@ use smithay::backend::{
     libinput::{LibinputInputBackend, LibinputSessionInterface},
     renderer::{
         gles2::{Gles2Frame, Gles2Renderer, Gles2Texture},
-        Bind, Frame, ImportDma, ImportEgl, Renderer, Transform,
+        Bind, Frame, ImportDma, ImportEgl, Renderer,
     },
     session::{auto::AutoSession, Session, Signal as SessionSignal},
     udev::{primary_gpu, UdevBackend, UdevEvent},
@@ -20,7 +20,7 @@ use smithay::backend::{
 use smithay::reexports::*;
 use smithay::utils::{
     signaling::{Linkable, SignalToken, Signaler},
-    Logical, Point,
+    Logical, Point, Transform,
 };
 use smithay::wayland::{
     dmabuf::init_dmabuf_global,
@@ -669,7 +669,7 @@ fn render_surface(
                     1,
                     scale as f64,
                     Transform::Normal,
-                    full(),
+                    &full(),
                     1.0,
                 )?;
             }
@@ -720,7 +720,7 @@ fn initial_render(
     let (dmabuf, _) = surface.next_buffer()?;
     renderer.bind(dmabuf)?;
 
-    let rendering = |_: &mut _, frame: &mut Gles2Frame| frame.clear([0.8, 0.8, 0.9, 1.0], full());
+    let rendering = |_: &mut _, frame: &mut Gles2Frame| frame.clear([0.8, 0.8, 0.9, 1.0], &full());
     renderer.render((1, 1).into(), Transform::Normal, rendering)??;
 
     surface.queue_buffer()?;
