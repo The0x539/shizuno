@@ -237,12 +237,13 @@ pub fn run(log: Logger) {
     }
 }
 
-struct OutputName(connector::Interface, u32);
-impl std::fmt::Display for OutputName {
+struct OutputName<'a>(&'a connector::Info);
+impl std::fmt::Display for OutputName<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = self.1;
+        let (iface, id) = (self.0.interface(), self.0.interface_id());
+
         use connector::Interface as Iface;
-        let short_name = match self.0 {
+        let short_name = match iface {
             Iface::DVII => "DVI-I",
             Iface::DVID => "DVI-D",
             Iface::DVIA => "DVI-A",
@@ -251,7 +252,7 @@ impl std::fmt::Display for OutputName {
             Iface::HDMIA => "HDMI-A",
             Iface::HDMIB => "HDMI-B",
             Iface::EmbeddedDisplayPort => "eDP",
-            other => return write!(f, "{other:?}-{id}"),
+            _ => return write!(f, "{iface:?}-{id}"),
         };
         write!(f, "{short_name}-{id}")
     }
@@ -273,21 +274,20 @@ fn scan_connectors(
 
     let mut backends = HashMap::new();
 
-    'conn: for conn in res_handles.connectors().iter().copied() {
-        let conn_info = device.get_connector(conn).unwrap();
+    'conn: for conn in res_handles.connectors() {
+        let conn_info = device.get_connector(*conn).unwrap();
         if conn_info.state() != connector::State::Connected {
             continue;
         }
 
-        let name = OutputName(conn_info.interface(), conn_info.interface_id());
+        let name = OutputName(&conn_info);
         info!(log, "Connected: {name}");
 
         for enc in conn_info.encoders() {
-            let handle = try_or!(continue, enc);
-            let enc_info = try_or!(continue, device.get_encoder(*handle).ok());
+            let enc_handle = try_or!(continue, enc.as_ref().copied());
+            let enc_info = try_or!(continue, device.get_encoder(enc_handle).ok());
 
-            let crtcs = res_handles.filter_crtcs(enc_info.possible_crtcs());
-            for crtc in crtcs {
+            for crtc in res_handles.filter_crtcs(enc_info.possible_crtcs()) {
                 let entry = match backends.entry(crtc) {
                     Entry::Vacant(v) => v,
                     Entry::Occupied(_) => continue,
@@ -349,7 +349,7 @@ fn setup_connector(
         model: "Generic DRM".into(),
     };
 
-    let name = OutputName(conn_info.interface(), conn_info.interface_id()).to_string();
+    let name = OutputName(&conn_info).to_string();
     let (output, global) = Output::new(display, name, props, None);
 
     // TODO: arrangements and what not
