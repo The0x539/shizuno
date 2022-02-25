@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 use std::collections::hash_map::{Entry, HashMap};
+use std::collections::HashSet;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use smithay::backend::{
-    allocator::dmabuf::Dmabuf,
-    drm::{DevPath, DrmDevice, DrmError, DrmEvent, GbmBufferedSurface},
+    allocator::{dmabuf::Dmabuf, Format},
+    drm::{DevPath, DrmDevice, DrmError, DrmEvent, GbmBufferedSurface, GbmBufferedSurfaceError},
     egl::{EGLContext as EglContext, EGLDisplay as EglDisplay},
     libinput::{LibinputInputBackend, LibinputSessionInterface},
     renderer::{
@@ -35,10 +36,7 @@ use calloop::{
     timer::{Timer, TimerHandle},
     Dispatcher, EventLoop, LoopHandle, RegistrationToken,
 };
-use drm::control::{
-    connector::{Interface, State as ConnectorState},
-    crtc, Device,
-};
+use drm::control::{connector, crtc, Device};
 use either::Either;
 use gbm::Device as GbmDevice;
 use image::{ImageBuffer, ImageFormat};
@@ -64,7 +62,7 @@ use crate::{
     state::{Backend, State},
 };
 
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 pub struct SessionFd(RawFd);
 impl AsRawFd for SessionFd {
     fn as_raw_fd(&self) -> RawFd {
@@ -166,7 +164,7 @@ pub fn run(log: Logger) {
         handle.insert_source(timer, cb).unwrap();
     }
 
-    let udev_backend = match UdevBackend::new(state.seat_name.clone(), log.clone()) {
+    let udev_backend = match UdevBackend::new(&state.seat_name, log.clone()) {
         Ok(v) => v,
         Err(e) => {
             crit!(log, "Failed to initialize udev backend"; "error" => e);
@@ -174,7 +172,8 @@ pub fn run(log: Logger) {
         }
     };
 
-    let libinput_event_source = {
+    // libinput events
+    {
         let interface = LibinputSessionInterface::from(state.backend_data.session.clone());
         let mut context = Libinput::new_with_udev(interface);
         context.udev_assign_seat(&state.seat_name).unwrap();
@@ -182,10 +181,11 @@ pub fn run(log: Logger) {
         backend.link(session_signal);
 
         let cb = cb!(event, state => state.process_input_event(event));
-        handle.insert_source(backend, cb).unwrap()
-    };
+        handle.insert_source(backend, cb).unwrap();
+    }
 
-    let session_event_source = handle.insert_source(notifier, cb!()).unwrap();
+    // session events
+    handle.insert_source(notifier, cb!()).unwrap();
 
     for (dev, path) in udev_backend.device_list() {
         state.device_added(dev, path.to_owned());
@@ -210,16 +210,14 @@ pub fn run(log: Logger) {
         init_dmabuf_global(&mut display.borrow_mut(), formats, handler, log.clone());
     }
 
-    let udev_event_source = {
+    // udev events
+    {
         let cb = cb!(event, state => match event {
             UdevEvent::Added { device_id, path } => state.device_added(device_id, path),
             UdevEvent::Changed { device_id } => state.device_changed(device_id),
             UdevEvent::Removed { device_id } => state.device_removed(device_id),
         });
-        handle
-            .insert_source(udev_backend, cb)
-            .map_err(std::io::Error::from)
-            .unwrap()
+        handle.insert_source(udev_backend, cb).unwrap();
     };
 
     state.start_xwayland();
@@ -237,14 +235,30 @@ pub fn run(log: Logger) {
             display.borrow_mut().flush_clients(&mut state);
         }
     }
+}
 
-    handle.remove(session_event_source);
-    handle.remove(libinput_event_source);
-    handle.remove(udev_event_source);
+struct OutputName(connector::Interface, u32);
+impl std::fmt::Display for OutputName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = self.1;
+        use connector::Interface as Iface;
+        let short_name = match self.0 {
+            Iface::DVII => "DVI-I",
+            Iface::DVID => "DVI-D",
+            Iface::DVIA => "DVI-A",
+            Iface::SVideo => "S-VIDEO",
+            Iface::DisplayPort => "DP",
+            Iface::HDMIA => "HDMI-A",
+            Iface::HDMIB => "HDMI-B",
+            Iface::EmbeddedDisplayPort => "eDP",
+            other => return write!(f, "{other:?}-{id}"),
+        };
+        write!(f, "{short_name}-{id}")
+    }
 }
 
 fn scan_connectors(
-    device: &mut DrmDevice<SessionFd>,
+    device: &DrmDevice<SessionFd>,
     gbm: &GbmDevice<SessionFd>,
     renderer: &mut Gles2Renderer,
     display: &mut Display,
@@ -254,121 +268,111 @@ fn scan_connectors(
 ) -> HashMap<crtc::Handle, Rc<RefCell<SurfaceData>>> {
     let res_handles = device.resource_handles().unwrap();
 
+    let formats =
+        Bind::<Dmabuf>::supported_formats(renderer).expect("dmabuf renderer without formats");
+
     let mut backends = HashMap::new();
 
-    for conn in res_handles.connectors().iter().copied() {
+    'conn: for conn in res_handles.connectors().iter().copied() {
         let conn_info = device.get_connector(conn).unwrap();
-        if conn_info.state() != ConnectorState::Connected {
+        if conn_info.state() != connector::State::Connected {
             continue;
         }
-        info!(log, "Connected: {:?}", conn_info.interface());
 
-        'enc: for enc in conn_info.encoders().iter().copied().flatten() {
-            let enc_info = match device.get_encoder(enc) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for crtc in res_handles.filter_crtcs(enc_info.possible_crtcs()) {
+        let name = OutputName(conn_info.interface(), conn_info.interface_id());
+        info!(log, "Connected: {name}");
+
+        for enc in conn_info.encoders() {
+            let handle = try_or!(continue, enc);
+            let enc_info = try_or!(continue, device.get_encoder(*handle).ok());
+
+            let crtcs = res_handles.filter_crtcs(enc_info.possible_crtcs());
+            for crtc in crtcs {
                 let entry = match backends.entry(crtc) {
                     Entry::Vacant(v) => v,
-                    _ => continue,
+                    Entry::Occupied(_) => continue,
                 };
 
-                info!(
-                    log,
-                    "Trying to setup connector {:?}-{} with crtc {:?}",
-                    conn_info.interface(),
-                    conn_info.interface_id(),
-                    crtc,
-                );
+                info!(log, "Trying to setup connector {name} with crtc {crtc:?}");
 
-                let mode = conn_info.modes()[0];
-
-                let mut surface = match device.create_surface(crtc, mode, &[conn_info.handle()]) {
-                    Ok(surface) => surface,
-                    Err(e) => {
-                        warn!(log, "Failed to create drm surface: {e}");
-                        continue;
-                    }
-                };
-                surface.link(signaler.clone());
-
-                let renderer_formats = Bind::<Dmabuf>::supported_formats(renderer)
-                    .expect("dmabuf renderer without formats");
-
-                let surface = match GbmBufferedSurface::new(
-                    surface,
-                    gbm.clone(),
-                    renderer_formats,
-                    log.clone(),
+                match setup_connector(
+                    device, gbm, display, space, signaler, &log, crtc, &conn_info, &formats,
                 ) {
-                    Ok(v) => v,
+                    Ok(data) => {
+                        entry.insert(Rc::new(RefCell::new(data)));
+                        continue 'conn;
+                    }
+                    Err(GbmBufferedSurfaceError::DrmError(e)) => {
+                        warn!(log, "Failed to create drm surface: {e}");
+                    }
                     Err(e) => {
                         warn!(log, "Failed to create rendering surface: {e}");
-                        continue;
                     }
-                };
-
-                let size = mode.size();
-                let mode = Mode {
-                    size: (size.0 as i32, size.1 as i32).into(),
-                    refresh: (mode.vrefresh() * 1000) as i32,
-                };
-
-                let other_short_name;
-                let interface_short_name = match conn_info.interface() {
-                    Interface::DVII => "DVI-I",
-                    Interface::DVID => "DVI-D",
-                    Interface::DVIA => "DVI-A",
-                    Interface::SVideo => "S-VIDEO",
-                    Interface::DisplayPort => "DP",
-                    Interface::HDMIA => "HDMI-A",
-                    Interface::HDMIB => "HDMI-B",
-                    Interface::EmbeddedDisplayPort => "eDP",
-                    other => {
-                        other_short_name = format!("{other:?}");
-                        &other_short_name
-                    }
-                };
-
-                let output_name = format!("{interface_short_name}-{}", conn_info.interface_id());
-
-                let (phys_w, phys_h) = conn_info.size().unwrap_or_default();
-                let props = PhysicalProperties {
-                    size: (phys_w as i32, phys_h as i32).into(),
-                    subpixel: Subpixel::Unknown,
-                    make: "Smithay".into(),
-                    model: "Generic DRM".into(),
-                };
-                let (output, global) = Output::new(display, output_name, props, None);
-                // TODO: arrangements and what not
-                let width = space
-                    .outputs()
-                    .map(|o| space.output_geometry(o).unwrap().size.w)
-                    .sum::<i32>();
-                let position = (width, 0).into();
-                output.change_current_state(Some(mode), None, None, Some(position));
-                output.set_preferred(mode);
-                space.map_output(&output, 1.0, position);
-
-                output.user_data().insert_if_missing(|| UdevOutputId {
-                    crtc,
-                    device_id: device.device_id(),
-                });
-
-                let surface_data = SurfaceData {
-                    surface,
-                    global: Some(global),
-                    #[cfg(feature = "debug")]
-                    fps: fps_ticker::Fps::default(),
-                };
-                entry.insert(Rc::new(RefCell::new(surface_data)));
-                break 'enc;
+                }
             }
         }
     }
 
     backends
+}
+
+fn setup_connector(
+    device: &DrmDevice<SessionFd>,
+    gbm: &GbmDevice<SessionFd>,
+    display: &mut Display,
+    space: &mut Space,
+    signaler: &Signaler<SessionSignal>,
+    log: &Logger,
+
+    crtc: crtc::Handle,
+    conn_info: &connector::Info,
+    formats: &HashSet<Format>,
+) -> Result<SurfaceData, GbmBufferedSurfaceError<std::io::Error>> {
+    let mode = conn_info.modes()[0];
+
+    let mut surface = device.create_surface(crtc, mode, &[conn_info.handle()])?;
+    surface.link(signaler.clone());
+
+    let surface = GbmBufferedSurface::new(surface, gbm.clone(), formats.clone(), log.clone())?;
+
+    let size = mode.size();
+    let mode = Mode {
+        size: (size.0 as i32, size.1 as i32).into(),
+        refresh: (mode.vrefresh() * 1000) as i32,
+    };
+
+    let (phys_w, phys_h) = conn_info.size().unwrap_or_default();
+    let props = PhysicalProperties {
+        size: (phys_w as i32, phys_h as i32).into(),
+        subpixel: Subpixel::Unknown,
+        make: "Smithay".into(),
+        model: "Generic DRM".into(),
+    };
+
+    let name = OutputName(conn_info.interface(), conn_info.interface_id()).to_string();
+    let (output, global) = Output::new(display, name, props, None);
+
+    // TODO: arrangements and what not
+    let width = space
+        .outputs()
+        .map(|o| space.output_geometry(o).unwrap().size.w)
+        .sum::<i32>();
+    let position = (width, 0).into();
+    output.change_current_state(Some(mode), None, None, Some(position));
+    output.set_preferred(mode);
+    space.map_output(&output, 1.0, position);
+
+    output.user_data().insert_if_missing(|| UdevOutputId {
+        crtc,
+        device_id: device.device_id(),
+    });
+
+    Ok(SurfaceData {
+        surface,
+        global: Some(global),
+        #[cfg(feature = "debug")]
+        fps: fps_ticker::Fps::default(),
+    })
 }
 
 impl State<UdevData> {
