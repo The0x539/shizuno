@@ -357,7 +357,7 @@ impl ShellHandles {
                 let mut popups = state.popups.borrow_mut();
                 let space = state.space.as_ref();
                 space.borrow_mut().commit(&surface);
-                surface_commit(&surface, &space, &mut popups);
+                surface_commit(&surface, space, &mut popups);
             },
             log.clone(),
         );
@@ -879,7 +879,10 @@ fn place_new_window(space: &mut Space, window: &Window, activate: bool) {
             let z = m.non_exclusive_zone();
             Some(Rectangle::from_loc_and_size(g.loc + z.loc, z.size))
         })
-        .unwrap_or(Rectangle::from_loc_and_size((0, 0), (800, 800)));
+        .unwrap_or(Rectangle {
+            loc: (0, 0).into(),
+            size: (800, 800).into(),
+        });
 
     let max_x = geometry.loc.x + (((geometry.size.w as f32) / 3.0) * 2.0) as i32;
     let max_y = geometry.loc.y + (((geometry.size.h as f32) / 3.0) * 2.0) as i32;
@@ -910,8 +913,8 @@ pub fn fixup_positions(space: &mut Space) {
     let boxes = outputs
         .iter()
         .flat_map(|o| {
-            let g = space.output_geometry(&o)?;
-            let m = layer_map_for_output(&o);
+            let g = space.output_geometry(o)?;
+            let m = layer_map_for_output(o);
             let z = m.non_exclusive_zone();
             Some(Rectangle::from_loc_and_size(g.loc + z.loc, z.size))
         })

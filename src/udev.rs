@@ -296,7 +296,7 @@ fn scan_connectors(
                 info!(log, "Trying to setup connector {name} with crtc {crtc:?}");
 
                 match setup_connector(
-                    device, gbm, display, space, signaler, &log, crtc, &conn_info, &formats,
+                    device, gbm, display, space, signaler, log, crtc, &conn_info, &formats,
                 ) {
                     Ok(data) => {
                         entry.insert(Rc::new(RefCell::new(data)));
@@ -316,6 +316,7 @@ fn scan_connectors(
     backends
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_connector(
     device: &DrmDevice<SessionFd>,
     gbm: &GbmDevice<SessionFd>,
@@ -349,7 +350,7 @@ fn setup_connector(
         model: "Generic DRM".into(),
     };
 
-    let name = OutputName(&conn_info).to_string();
+    let name = OutputName(conn_info).to_string();
     let (output, global) = Output::new(display, name, props, None);
 
     // TODO: arrangements and what not
@@ -402,7 +403,7 @@ impl State<UdevData> {
             };
         }
 
-        let mut device = attempt!("drm", DrmDevice::new(fd.clone(), true, self.log.clone()));
+        let mut device = attempt!("drm", DrmDevice::new(fd, true, self.log.clone()));
         let gbm = attempt!("gbm", GbmDevice::new(fd));
         let egl = attempt!("egl display", EglDisplay::new(&gbm, self.log.clone()));
         let context = attempt!("egl context", EglContext::new(&egl, self.log.clone()));
@@ -423,7 +424,7 @@ impl State<UdevData> {
         }
 
         let surfaces = Rc::new(RefCell::new(scan_connectors(
-            &mut device,
+            &device,
             &gbm,
             &mut renderer.borrow_mut(),
             &mut self.display.borrow_mut(),
@@ -502,7 +503,7 @@ impl State<UdevData> {
         unmap_outputs(&mut space, device_id);
 
         backend_data.surfaces.set(scan_connectors(
-            &mut backend_data.event_dispatcher.as_source_mut(),
+            &backend_data.event_dispatcher.as_source_ref(),
             &backend_data.gbm,
             &mut backend_data.renderer.borrow_mut(),
             &mut self.display.borrow_mut(),
