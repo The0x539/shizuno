@@ -456,7 +456,7 @@ fn xdg_shell_impl<B: Backend + 'static>(
                 .window_for_surface(surface.get_surface().unwrap())
                 .unwrap()
                 .clone();
-            let mut initial_window_location = space.borrow().window_geometry(&window).unwrap().loc;
+            let mut initial_window_location = space.borrow().window_location(&window).unwrap();
 
             if let Some(cur_state) = surface.current_state() {
                 if cur_state.states.contains(xdg_toplevel::State::Maximized) {
@@ -521,10 +521,9 @@ fn xdg_shell_impl<B: Backend + 'static>(
                 .unwrap()
                 .clone();
 
-            let geometry = space.borrow().window_geometry(&window).unwrap();
-
-            let initial_window_location = geometry.loc;
-            let initial_window_size = geometry.size;
+            let geometry = window.geometry();
+            let loc = space.borrow().window_location(&window).unwrap();
+            let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
             let edges = edges.into();
             with_states(surface.get_surface().unwrap(), move |states| {
@@ -788,7 +787,8 @@ fn surface_commit(surface: &WlSurface, space: &RefCell<Space>, popups: &mut Popu
             }
         }
 
-        let geometry = space.window_geometry(window).unwrap();
+        let geometry = window.geometry();
+        let window_loc = space.window_location(&window).unwrap();
         let new_location = with_states(surface, |states| {
             let mut data = states
                 .data_map
@@ -809,7 +809,7 @@ fn surface_commit(surface: &WlSurface, space: &RefCell<Space>, popups: &mut Popu
                     } = resize_data;
 
                     if edges.intersects(ResizeEdge::TOP_LEFT) {
-                        let mut location = geometry.loc;
+                        let mut location = window_loc;
 
                         if edges.intersects(ResizeEdge::LEFT) {
                             location.x = initial_window_location.x
@@ -922,8 +922,9 @@ pub fn fixup_positions(space: &mut Space) {
 
     let mut orphaned_windows = Vec::new();
     for window in space.windows() {
-        let window_geo = try_or!(continue, space.window_geometry(window));
-        if !boxes.iter().any(|g| g.contains(window_geo.loc)) {
+        let window_location = try_or!(continue, space.window_location(window));
+        let geo_loc = window.bbox().loc + window_location;
+        if !boxes.iter().any(|g| g.contains(geo_loc)) {
             orphaned_windows.push(window.clone());
         }
     }
