@@ -3,8 +3,9 @@
 use slog::{Drain, Logger};
 
 fn main() {
-    let drain = slog_async::Async::default(slog_term::term_full().fuse()).fuse();
-    let log = Logger::root(drain, slog::o!());
+    let drain = slog_journald::JournaldDrain.fuse();
+    let o = slog::o!("SYSLOG_IDENTIFIER" => shizuno::NAME);
+    let log = Logger::root(drain, o);
 
     shizuno::udev::run(log);
 }

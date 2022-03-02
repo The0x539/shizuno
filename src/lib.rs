@@ -1,6 +1,6 @@
 #![deny(rust_2018_idioms)]
 
-const NAME: &str = "shizuno";
+pub const NAME: &str = "shizuno";
 
 #[macro_use]
 mod util;
