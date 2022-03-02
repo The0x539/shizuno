@@ -7,5 +7,7 @@ fn main() {
     let o = slog::o!("SYSLOG_IDENTIFIER" => shizuno::NAME);
     let log = Logger::root(drain, o);
 
+    shizuno::config::init(&log);
+
     shizuno::udev::run(log);
 }
