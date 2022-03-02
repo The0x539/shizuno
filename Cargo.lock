@@ -971,6 +971,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "shizuno"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "dirs",
+ "either",
+ "fps_ticker",
+ "image",
+ "once_cell",
+ "rand",
+ "serde",
+ "slog",
+ "slog-async",
+ "slog-term",
+ "smithay",
+ "sugars",
+ "thiserror",
+ "toml",
+ "x11rb",
+ "xcursor",
+ "xkbcommon",
+]
+
+[[package]]
 name = "slog"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1362,30 +1386,6 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
-
-[[package]]
-name = "wm"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "dirs",
- "either",
- "fps_ticker",
- "image",
- "once_cell",
- "rand",
- "serde",
- "slog",
- "slog-async",
- "slog-term",
- "smithay",
- "sugars",
- "thiserror",
- "toml",
- "x11rb",
- "xcursor",
- "xkbcommon",
-]
 
 [[package]]
 name = "x11rb"

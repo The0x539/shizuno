@@ -1,6 +1,6 @@
 #![deny(rust_2018_idioms)]
 
-const NAME: &str = "wm"; // TODO: rebrand
+const NAME: &str = "shizuno";
 
 #[macro_use]
 mod util;

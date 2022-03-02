@@ -53,7 +53,7 @@ x11rb::atom_manager! {
     Atoms: AtomsCookie {
         WM_S0,
         WL_SURFACE_ID,
-        ANVIL_CLOSE_CONNECTION,
+        CLOSE_CONNECTION,
     }
 }
 
@@ -110,10 +110,7 @@ impl X11State {
             space,
         };
 
-        Ok((
-            wm,
-            X11Source::new(conn, win, atoms.ANVIL_CLOSE_CONNECTION, log),
-        ))
+        Ok((wm, X11Source::new(conn, win, atoms.CLOSE_CONNECTION, log)))
     }
 
     fn handle_event(&mut self, event: Event, client: &Client) -> Result<(), ReplyOrIdError> {
