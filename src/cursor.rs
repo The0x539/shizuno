@@ -16,13 +16,10 @@ pub struct Cursor {
 
 impl Cursor {
     pub fn load(log: &Logger) -> Self {
-        let name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
-        let size = std::env::var("XCURSOR_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24);
+        let cfg = &crate::config::get().xcursor;
+        let (name, size) = (&cfg.theme, cfg.size);
 
-        let theme = CursorTheme::load(&name);
+        let theme = CursorTheme::load(name);
         let icons = match load_icon(&theme) {
             Ok(theme) => theme,
             Err(e) => {

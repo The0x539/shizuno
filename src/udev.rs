@@ -329,6 +329,7 @@ fn setup_connector(
     conn_info: &connector::Info,
     formats: &HashSet<Format>,
 ) -> Result<SurfaceData, GbmBufferedSurfaceError<std::io::Error>> {
+    // TODO: honor configured mode
     let mode = conn_info.modes()[0];
 
     let mut surface = device.create_surface(crtc, mode, &[conn_info.handle()])?;
@@ -351,7 +352,7 @@ fn setup_connector(
     };
 
     let name = OutputName(conn_info).to_string();
-    let (output, global) = Output::new(display, name, props, None);
+    let (output, global) = Output::new(display, name.clone(), props, None);
 
     // TODO: arrangements and what not
     let width = space
@@ -361,7 +362,9 @@ fn setup_connector(
     let position = (width, 0).into();
     output.change_current_state(Some(mode), None, None, Some(position));
     output.set_preferred(mode);
-    space.map_output(&output, 1.0, position);
+
+    let scale = crate::config::get().display_scale(&name);
+    space.map_output(&output, scale, position);
 
     output.user_data().insert_if_missing(|| UdevOutputId {
         crtc,
