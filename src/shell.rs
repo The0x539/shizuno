@@ -788,7 +788,7 @@ fn surface_commit(surface: &WlSurface, space: &RefCell<Space>, popups: &mut Popu
         }
 
         let geometry = window.geometry();
-        let window_loc = space.window_location(&window).unwrap();
+        let window_loc = space.window_location(window).unwrap();
         let new_location = with_states(surface, |states| {
             let mut data = states
                 .data_map
